@@ -1,12 +1,13 @@
-# Checkmarx One SCA exposure exporter
+# Checkmarx One SCA and Container Security exporter
 
-Exports the open-source dependency (SCA) results of your Checkmarx One projects into
-CSV and JSON files for review in Excel or Power BI: every package, every reported
-vulnerability, and which project, application and branch it belongs to.
+Exports the open-source dependency (SCA) and, optionally, the Container Security results
+of your Checkmarx One projects into CSV and JSON files for review in Excel or Power BI:
+every package, every reported vulnerability, and which project, application and branch
+(and, for containers, which image) it belongs to.
 
 - Python 3.10+ on Windows, Linux or macOS; one dependency (`requests`).
 - **Read-only.** It never starts scans, changes findings or edits projects. Its only
-  POST requests log in and ask Checkmarx to generate reports.
+  POST requests log in and ask Checkmarx to generate SCA reports.
 - Works with Checkmarx One cloud (any region) using an API key or OAuth client.
 
 > **Reported exposure, not verified production exposure.** A vulnerable npm or PyPI
@@ -20,6 +21,8 @@ vulnerability, and which project, application and branch it belongs to.
 - [Configuration](#configuration)
 - [SSL errors on a company network](#ssl-errors-on-a-company-network)
 - [Usage](#usage)
+  - [Choose scan types (SCA, Container Security)](#choose-scan-types)
+  - [Choose projects (including a CSV of project IDs)](#choose-projects)
 - [Output files](#output-files)
 - [Reading the results](#reading-the-results)
 - [Security notes](#security-notes)
@@ -39,6 +42,8 @@ Check `pilot\coverage.csv` and `pilot\findings.csv`, then run against everything
 ```powershell
 python checkmarx_exposure.py --out all-products              # latest scan per branch
 python checkmarx_exposure.py --dump-all --out full-dump      # every retained scan
+python checkmarx_exposure.py --scan-types sca,containers --out with-containers
+python checkmarx_exposure.py --project-ids-file my-projects.csv --scan-types sca,containers --out selected
 ```
 
 Each `--out` folder must be new, so results from different runs never mix.
@@ -76,6 +81,8 @@ verify_ssl = true
   If both an API key and OAuth client are configured, the API key wins.
 - The API identity needs read access to the projects and scans you want, and permission
   to generate SCA exports. SCA must be licensed and the scans must include SCA results.
+- For `--scan-types containers`, Container Security must be licensed, the scans must
+  include the containers engine, and the identity needs permission to view scan results.
 
 ### Environment variables only
 
@@ -144,17 +151,45 @@ verify_ssl = C:\Secure\company-root-ca.pem
 
 | Mode | Command | Which scans are exported |
 | --- | --- | --- |
-| Latest (default) | `python checkmarx_exposure.py --out DIR` | Per branch, the newest scan whose SCA engine completed |
-| Full dump | `python checkmarx_exposure.py --dump-all --out DIR` | Every retained scan with a completed SCA engine, plus the original Checkmarx scan report for each |
+| Latest (default) | `python checkmarx_exposure.py --out DIR` | Per branch and scan type, the newest scan whose engine (SCA or containers) completed |
+| Full dump | `python checkmarx_exposure.py --dump-all --out DIR` | Every retained scan with a completed engine of each chosen type, plus the original Checkmarx SCA scan report for each |
 
-Full dumps are slower and repeat the same packages and findings across scans. Failed,
-incomplete or non-SCA scans are still listed in `scans.csv` and `coverage.csv`, but have
-no report to export. There is no resume: if a run stops, start again in a new folder.
+Each scan type is chosen separately, so the SCA and container rows for a branch can
+come from different scans if one engine failed in the latest scan. Full dumps are slower
+and repeat the same packages and findings across scans. Failed, incomplete or skipped
+engines are still listed in `scans.csv` and `coverage.csv`, but have nothing to export.
+There is no resume: if a run stops, start again in a new folder.
+
+### Choose scan types
+
+| Option | Exports |
+| --- | --- |
+| `--scan-types sca` (default) | SCA only, exactly as before: `packages.csv`, `findings.csv`, `matches.csv` |
+| `--scan-types containers` | Container Security only: `container_findings.csv`, `container_matches.csv` |
+| `--scan-types sca,containers` | Both |
+
+- `container-security` and `container` are accepted for `containers` (as in the
+  Checkmarx CLI's `--scan-types`). Case is ignored.
+- All output files are always created; the ones for a type you did not choose only
+  have a header row.
+- `coverage.csv` has one row per project, branch **and scan type**; see `scan_type`.
+- Container findings are read the way the official Checkmarx CLI (`cx results show`)
+  reads them: `GET /api/results?scan-id=...` for the scan, keeping results of type
+  `containers`. A scan counts only when its `containers` engine completed.
+- Works with every project filter, `--branch` and `--dump-all`.
+
+```powershell
+python checkmarx_exposure.py --scan-types containers --out containers-only
+python checkmarx_exposure.py --scan-types sca,containers --application "Mobile Banking" --out mobile
+python checkmarx_exposure.py --dump-all --scan-types sca,containers --out full-dump
+```
 
 ### Choose projects
 
 | Option | Matches |
 | --- | --- |
+| `--project-id ID` | Exactly this project ID; repeat or comma-separate for several (`--project-id ID1,ID2`) |
+| `--project-ids-file FILE.csv` | Exactly the project IDs listed in a CSV file (see below) |
 | `--project TEXT` | Project names containing this text |
 | `--tag KEY` | Projects with this tag, any value |
 | `--tag KEY=VALUE` | Projects with exactly this tag and value |
@@ -167,19 +202,41 @@ no report to export. There is no resume: if a run stops, start again in a new fo
   blue-team projects that are in Payments.
 - `--application` stops with an error if the application list cannot be read, rather
   than export the wrong set of projects.
+- `--project-id` and `--project-ids-file` together count as one option: projects in
+  either are included.
 - These options work in both modes, including `--dump-all`.
 
 ```powershell
+python checkmarx_exposure.py --project-ids-file my-projects.csv --scan-types sca,containers --out selected
+python checkmarx_exposure.py --project-id 1b2c3d4e-0000-0000-0000-000000000000 --out one-project
 python checkmarx_exposure.py --tag team=payments --tag pci --out tagged
 python checkmarx_exposure.py --application "Mobile Banking" --out mobile
 python checkmarx_exposure.py --dump-all --group "GROUP_FROM_PROJECTS_CSV" --out group-dump
 ```
 
+#### A CSV of project IDs
+
+Put one project ID per row. With a header row, the IDs are read from the column named
+`project_id` (or `Project ID`, `projectId`, `id`) and other columns are ignored, so a
+`projects.csv` from an earlier run works as is. Without one of those headers, the first
+column is used. Blank lines and spaces around IDs are ignored.
+
+```csv
+project_id,note
+1b2c3d4e-0000-0000-0000-000000000000,Payments API
+5f6a7b8c-0000-0000-0000-000000000000,Web shop
+```
+
+IDs that are not exported (mistyped, deleted, not visible to the API identity, or
+excluded by another filter) are listed in a `WARNING:` line and under `metadata_errors`
+in `run.json`, and the run exits with code 2. Find project IDs in `projects.csv` or in
+the project's page in Checkmarx One.
+
 ### Choose findings
 
-These narrow `matches.csv` only; `packages.csv` and `findings.csv` always keep
-everything. They cannot be combined with `--dump-all` (filter `findings.csv` in Excel or
-Power BI instead).
+These narrow `matches.csv` and `container_matches.csv` only; the other files always
+keep everything. They cannot be combined with `--dump-all` (filter the findings files in
+Excel or Power BI instead).
 
 | Option | Matches |
 | --- | --- |
@@ -187,7 +244,9 @@ Power BI instead).
 | `--package TEXT` | Package names containing this text |
 | `--cve ID` | Exact vulnerability ID or alias |
 
-A finding must match every option given.
+A finding must match every option given. `--ecosystems` applies to SCA only, since
+container results describe image (OS) packages without a package-URL ecosystem; for
+`container_matches.csv` only `--package` and `--cve` are used.
 
 ```powershell
 python checkmarx_exposure.py --ecosystems npm --out npm-review
@@ -200,7 +259,7 @@ python checkmarx_exposure.py --cve CVE-YYYY-NNNNN --out cve-review
 | Option | Default | Meaning |
 | --- | --- | --- |
 | `--branch NAME` | every branch | Only this exact branch (latest mode only). No branch is assumed to be production. |
-| `--raw-scan-report` | off (on with `--dump-all`) | Also save Checkmarx's original scan report JSON |
+| `--raw-scan-report` | off (on with `--dump-all`) | Also save Checkmarx's original SCA scan report JSON |
 | `--stale-days N` | 30 | Scans older than this are marked `stale_or_unknown_date` |
 | `--export-timeout SECONDS` | 600 | Time allowed for Checkmarx to produce each report |
 | `--product-map FILE.csv` | project name | Map projects to business products (see below) |
@@ -225,7 +284,9 @@ REPLACE_WITH_PROJECT_UUID,Product A
 | `packages.csv` | Every package in every exported scan, vulnerable or not |
 | `findings.csv` | Every vulnerability/package pair, with severity and triage state |
 | `matches.csv` | The `findings.csv` rows that match `--ecosystems`, `--package` and `--cve` |
-| `coverage.csv` | One row per project and branch (per scan with `--dump-all`): what was exported, and any gaps or errors |
+| `container_findings.csv` | Every Container Security finding: image, package, vulnerability, severity, state (`--scan-types containers`) |
+| `container_matches.csv` | The `container_findings.csv` rows that match `--package` and `--cve` |
+| `coverage.csv` | One row per project, branch and scan type (per scan with `--dump-all`): what was exported, and any gaps or errors |
 | `projects.csv` | Projects in scope with tags, groups and applications |
 | `applications.csv` | Applications with tags, description, criticality and project IDs |
 | `application_projects.csv` | One row per application/project pair; use as a bridge table in Power BI |
@@ -233,12 +294,14 @@ REPLACE_WITH_PROJECT_UUID,Product A
 | `run.json` | Time, scope, filters, SSL mode, metadata errors and limitations |
 | `raw/*.cdx.json` | Original CycloneDX report for each exported scan |
 | `raw/*.scan-report.json` | Original Checkmarx scan report (`--raw-scan-report` / `--dump-all`) |
+| `raw/*.containers.json` | Original Container Security result records for each exported scan |
 | `raw/scans-PROJECT_ID.jsonl` | Original scan records per project |
 | `raw/projects.json`, `raw/applications.json` | Original project and application lists |
 
 ### Common columns
 
-Rows in `packages`, `findings`, `matches`, `coverage` and `scans` carry:
+Rows in `packages`, `findings`, `matches`, `container_findings`, `container_matches`,
+`coverage` and `scans` carry:
 
 - `project`, `project_id`, `product`, `branch`, `scan_id`, `scan_date`, `scan_age_days`
 - `applications`: application names as plain text separated by `; ` (empty when none)
@@ -247,6 +310,15 @@ Rows in `packages`, `findings`, `matches`, `coverage` and `scans` carry:
 - `application_mapping_status`: `resolved`, `unassigned`, or `partial_or_unknown` when
   applications could not be fully read
 - `project_tags_json`, `scan_tags_json`: tags as JSON, keeping empty values
+
+### Container findings columns
+
+`container_findings.csv` has the common columns plus `image_name`, `image_tag`,
+`image_file_path` (for example the Dockerfile), `image_origin`, `package`, `version`,
+`package_identifier`, `vulnerability` (CVE), `cwe`, `cvss_score`, `severity`, `state`
+(triage, for example `TO_VERIFY` or `NOT_EXPLOITABLE`), `status` (`NEW`, `RECURRENT`),
+`first_found_at`, `found_at`, `recommended_version`, `description`, `result_id` and
+`similarity_id`. Values are copied as Checkmarx returns them; severity is lower-cased.
 
 Raw report files are named by scan ID; find a file's project by looking up its
 `scan_id` in `coverage.csv`. (The reports themselves may contain only a project name
@@ -278,12 +350,16 @@ time**, not at scan time.
 | `exported` | Report exported; scan is within `--stale-days` |
 | `stale_or_unknown_date` | Report exported, but the scan is older than `--stale-days` or undated |
 | `no_confirmed_completed_sca` | No scan with a completed SCA engine on this branch (or this scan's SCA did not complete) |
+| `no_confirmed_completed_containers` | The same for the Container Security (`containers`) engine |
 | `export_error` | Report generation or download failed; see `error` |
 | `scan_list_error` | The project's scans could not be listed |
 | `no_scans_in_scope` | No scans (on `--branch`, if given) |
 
+- `scan_type`: `sca` or `containers`.
 - `newer_scan_than_selected = True`: a newer scan exists than the one exported (it may
-  have failed, still be running, or lack SCA). Worth a look.
+  have failed, still be running, or lack that engine). Worth a look.
+- For container rows, `package_count` is the number of distinct image/package/version
+  combinations with findings (Checkmarx's results list holds only vulnerable packages).
 - `scan_role` (`--dump-all`): `current` for each branch's newest completed SCA scan,
   `historical` for older ones.
 
@@ -307,7 +383,8 @@ outside the API identity's permissions, cannot be exported.
 - Credentials are never written to output files or error messages. Error text has
   request paths, query strings and proxy passwords removed.
 - Reports are downloaded from the authenticated
-  `/api/sca/export/requests/{exportId}/download` endpoint on your `base_url`. If that
+  `/api/sca/export/requests/{exportId}/download` endpoint on your `base_url`; container
+  results are read from `/api/results` on the same host. If that
   redirects to another host (for example cloud storage), the API token is not sent there.
 - Report files are saved byte-for-byte as received.
 - CSV cells starting with `=`, `+`, `-` or `@` get a leading `'` so Excel does not run
@@ -321,7 +398,8 @@ python -m unittest -v test_checkmarx_exposure.py
 ```
 
 The tests use mocked API responses and sample CycloneDX data: pagination, per-branch
-fallback when SCA failed, finding and project filters, unlinked references, missing
+fallback when SCA failed, container results and their paging, scan-type selection,
+project ID lists and CSV files, finding and project filters, unlinked references, missing
 vulnerability data, export polling (including temporary 400/404 replies), downloads
 and redirects, UTF-8 BOM handling, SSL settings, config handling and secret redaction.
 They have not been run against a live tenant.
@@ -333,4 +411,7 @@ API behaviour is based on the Checkmarx documentation and the official Checkmarx
 - ast-cli wrappers: [export-http.go](https://github.com/Checkmarx/ast-cli/blob/main/internal/wrappers/export-http.go),
   [client.go](https://github.com/Checkmarx/ast-cli/blob/main/internal/wrappers/client.go),
   [scans.go](https://github.com/Checkmarx/ast-cli/blob/main/internal/wrappers/scans.go),
-  [projects.go](https://github.com/Checkmarx/ast-cli/blob/main/internal/wrappers/projects.go)
+  [projects.go](https://github.com/Checkmarx/ast-cli/blob/main/internal/wrappers/projects.go),
+  [results-http.go](https://github.com/Checkmarx/ast-cli/blob/main/internal/wrappers/results-http.go)
+  and [results-json.go](https://github.com/Checkmarx/ast-cli/blob/main/internal/wrappers/results-json.go)
+  (container results), [result.go](https://github.com/Checkmarx/ast-cli/blob/main/internal/commands/result.go)

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Export Checkmarx One SCA evidence. Python 3.10+, requests. See README.md."""
+"""Export Checkmarx One SCA and Container Security evidence. Python 3.10+, requests. See README.md."""
 import argparse
 import base64
 import configparser
@@ -26,6 +26,11 @@ CONNECT_TIMEOUT, READ_TIMEOUT = 15, 120
 PAGE_SIZE = 100
 POLL_INTERVAL = 5  # Seconds; matches Checkmarx ast-cli export polling.
 EXPORT_ENDPOINT = '/api/sca/export/requests'
+RESULTS_ENDPOINT = '/api/results'  # All engines' results; ast-cli reads container findings here.
+RESULTS_PAGE_SIZE = 10000  # ast-cli's page length for /api/results.
+# --scan-types values -> engine names in scan statusDetails (ast-cli maps container-security too).
+SCAN_TYPES = {'sca': 'sca', 'containers': 'containers', 'container': 'containers',
+              'container-security': 'containers'}
 REDIRECTS = (301, 302, 303, 307, 308)
 SEVERITY_RANK = {'critical': 5, 'high': 4, 'medium': 3, 'low': 2, 'info': 1, 'none': 0}
 ECOSYSTEM_ALIASES = {'node': 'npm', 'nodejs': 'npm', 'python': 'pypi'}
@@ -263,6 +268,30 @@ class Client:
                 raise ExportError('Report generation timed out')
             time.sleep(POLL_INTERVAL)
 
+    def results(self, scan_id):
+        """All results of a scan from /api/results, paged the way ast-cli does (offset = page number)."""
+        page, seen, results = 0, set(), []
+        while True:
+            body = self.api('GET', RESULTS_ENDPOINT, params={
+                'scan-id': scan_id, 'limit': RESULTS_PAGE_SIZE, 'sort': '-severity', 'offset': page})
+            batch = body.get('results')
+            if batch is None:
+                batch = []  # Checkmarx omits the array when a scan has no results.
+            if not isinstance(batch, list):
+                raise ExportError(f'{RESULTS_ENDPOINT}: unexpected results schema')
+            if not batch:
+                return results
+            fresh = [r for r in batch if r.get('id') not in seen or not r.get('id')]
+            if not fresh:
+                raise ExportError(f'{RESULTS_ENDPOINT}: pagination returned only repeated IDs')
+            for r in fresh:
+                seen.add(r.get('id'))
+                results.append(r)
+            total = body.get('totalCount')
+            if not isinstance(total, int) or len(results) >= total or len(batch) < RESULTS_PAGE_SIZE:
+                return results
+            page += 1
+
     def _request_export(self, scan_id, fmt, deadline):
         payload = {'ScanID': scan_id, 'FileFormat': fmt, 'ExportParameters': {
             'hideDevAndTestDependencies': False, 'showOnlyEffectiveLicenses': False,
@@ -299,10 +328,14 @@ def field(obj, name, default=''):
     return next((v for k, v in obj.items() if k.lower() == name.lower()), default)
 
 
-def sca_completed(scan):
-    return any(str(field(d, 'name')).lower() == 'sca' and
+def engine_completed(scan, engine):
+    return any(str(field(d, 'name')).lower() == engine and
                str(field(d, 'status')).lower() == 'completed'
                for d in scan.get('statusDetails') or [])
+
+
+def sca_completed(scan):
+    return engine_completed(scan, 'sca')
 
 
 def parse_date(value):
@@ -321,8 +354,8 @@ def newest_first(scans):
     return sorted(scans, key=lambda s: parse_date(s.get('createdAt')), reverse=True)
 
 
-def choose_scans(scans, branch=None):
-    """Per branch: (branch, newest scan, newest scan with completed SCA or None)."""
+def choose_scans(scans, branch=None, engine='sca'):
+    """Per branch: (branch, newest scan, newest scan whose engine completed, or None)."""
     groups = {}
     for scan in scans:
         if branch is None or branch_of(scan) == branch:
@@ -330,7 +363,7 @@ def choose_scans(scans, branch=None):
     chosen = []
     for name, items in sorted(groups.items()):
         items = newest_first(items)
-        chosen.append((name, items[0], next((s for s in items if sca_completed(s)), None)))
+        chosen.append((name, items[0], next((s for s in items if engine_completed(s, engine)), None)))
     return chosen
 
 
@@ -389,11 +422,38 @@ def flatten(bom, context):
     return packages, findings, status, unresolved
 
 
+def container_findings(results, context):
+    """Container Security rows (result type "containers") from /api/results, one per finding."""
+    rows = []
+    for r in results:
+        if str(r.get('type', '')).lower() != 'containers':
+            continue
+        data = r.get('data') or {}
+        details = r.get('vulnerabilityDetails') or {}
+        recommended = data.get('recommendedVersion')
+        rows.append({**context, 'result_id': r.get('id', ''), 'similarity_id': r.get('similarityId', ''),
+                     'image_name': data.get('imageName', ''), 'image_tag': data.get('imageTag', ''),
+                     'image_file_path': data.get('imageFilePath', ''), 'image_origin': data.get('imageOrigin', ''),
+                     'package': data.get('packageName', ''), 'version': data.get('packageVersion', ''),
+                     'package_identifier': data.get('packageIdentifier', ''),
+                     'vulnerability': details.get('cveName') or data.get('queryName') or '',
+                     'aliases': data.get('queryName', '') if details.get('cveName') else '',
+                     'cwe': details.get('cweId') or '', 'cvss_score': details.get('cvssScore', ''),
+                     'severity': str(r.get('severity') or 'unknown').lower(),
+                     'state': r.get('state', ''), 'status': r.get('status', ''),
+                     'first_found_at': r.get('firstFoundAt', ''), 'found_at': r.get('foundAt', ''),
+                     'recommended_version': recommended if isinstance(recommended, str) else
+                     (encoded(recommended) if recommended else ''),
+                     'description': r.get('description', ''), 'runtime_verified': 'not_assessed'})
+    return rows
+
+
 META = ['application_ids_json', 'application_names_json', 'application_tags_json', 'application_mapping_status', 'project_tags_json', 'scan_tags_json']
 BASE = META + ['product', 'product_mapping', 'project', 'applications', 'project_id', 'branch', 'scan_id', 'scan_date', 'scan_age_days']
 PKG = BASE + ['component_ref', 'package', 'version', 'ecosystem', 'purl', 'scope', 'component_type', 'runtime_verified']
 FIND = PKG + ['vulnerability', 'aliases', 'severity', 'ratings_json', 'analysis_state', 'recommendation', 'affected_versions_json', 'source_url', 'package_link_status']
-COVER = BASE + ['scan_role', 'status', 'latest_scan_id', 'latest_scan_status', 'newer_scan_than_selected', 'vulnerability_section', 'package_count', 'finding_count', 'unresolved_links', 'runtime_verified', 'error']
+CONTAINER = BASE + ['result_id', 'similarity_id', 'image_name', 'image_tag', 'image_file_path', 'image_origin', 'package', 'version', 'package_identifier', 'vulnerability', 'aliases', 'cwe', 'cvss_score', 'severity', 'state', 'status', 'first_found_at', 'found_at', 'recommended_version', 'description', 'runtime_verified']
+COVER = BASE + ['scan_type', 'scan_role', 'status', 'latest_scan_id', 'latest_scan_status', 'newer_scan_than_selected', 'vulnerability_section', 'package_count', 'finding_count', 'unresolved_links', 'runtime_verified', 'error']
 PROJECT_FIELDS = ['project_id', 'project', 'applications', 'product', 'product_mapping', 'main_branch', 'repo_url', 'groups_json'] + META
 LINK_FIELDS = ['application_id', 'application', 'project_id', 'project', 'application_tags_json', 'project_tags_json']
 SCAN_FIELDS = BASE + ['status', 'status_details_json', 'engines_json']
@@ -486,6 +546,7 @@ def project_filter(args, apps):
         return [v.strip().lower() for v in values or [] if v.strip()]
     tags = [tuple(t.split('=', 1)) if '=' in t else (t, None) for t in fold(args.tag)]
     wanted_apps, groups = fold(args.application), fold(args.group)
+    ids = set(project_ids(args))
 
     def tag_match(project):
         have = {str(k).lower(): str(v or '').lower() for k, v in (project.get('tags') or {}).items()}
@@ -497,11 +558,31 @@ def project_filter(args, apps):
         return bool(names & set(wanted_apps))
 
     def matches(project):
-        return ((not args.project or args.project.lower() in project['name'].lower()) and
+        return ((not ids or str(project['id']).lower() in ids) and
+                (not args.project or args.project.lower() in project['name'].lower()) and
                 (not tags or tag_match(project)) and
                 (not wanted_apps or app_match(project)) and
                 (not groups or bool({str(g).lower() for g in project.get('groups') or []} & set(groups))))
     return matches
+
+
+def project_ids(args):
+    """--project-id values (repeatable, comma-separated), lower-cased."""
+    return [x.strip().lower() for v in getattr(args, 'project_id', None) or [] for x in v.split(',') if x.strip()]
+
+
+def load_project_ids(path):
+    """Project IDs from a CSV: the project_id (or id) column if there is a header, else the first column."""
+    with path.open(encoding='utf-8-sig', newline='') as f:
+        rows = [[cell.strip() for cell in row] for row in csv.reader(f)]
+    rows = [r for r in rows if any(r)]
+    column = 0
+    if rows:
+        names = [c.lower().replace(' ', '_') for c in rows[0]]
+        header = next((n for n in ('project_id', 'projectid', 'id') if n in names), None)
+        if header:
+            column, rows = names.index(header), rows[1:]
+    return [r[column] for r in rows if len(r) > column and r[column]]
 
 
 def file_stem(identifier):
@@ -526,13 +607,19 @@ def parse_args(argv=None):
     p.add_argument('--insecure', action='store_true',
                    help='Turn off all SSL checks for this run (same as verify_ssl = false)')
     p.add_argument('--project', help='Case-insensitive project name substring')
+    p.add_argument('--project-id', action='append', metavar='ID[,ID...]',
+                   help='Exact Checkmarx project ID; repeat or comma-separate for several')
+    p.add_argument('--project-ids-file', type=Path, metavar='FILE.csv',
+                   help='CSV of project IDs (project_id/id column, or first column without a header)')
+    p.add_argument('--scan-types', default='sca', metavar='TYPES',
+                   help='Comma-separated results to export: sca, containers (or container-security). Default sca')
     p.add_argument('--tag', action='append', metavar='KEY[=VALUE]',
                    help='Project tag key, or exact key=value; repeat for alternatives (case-insensitive)')
     p.add_argument('--application', action='append', metavar='NAME_OR_ID',
                    help='Exact application name or ID; repeat for alternatives (case-insensitive)')
     p.add_argument('--group', action='append', metavar='GROUP',
                    help='Project group as returned by the API; repeat for alternatives (case-insensitive)')
-    p.add_argument('--branch', help='Exact branch; default: latest completed SCA for each observed branch')
+    p.add_argument('--branch', help='Exact branch; default: latest completed scan of each type for each observed branch')
     p.add_argument('--ecosystems', default='', help='Comma-separated purl ecosystems; npm,pypi (or nodejs,python). Default all')
     p.add_argument('--package', help='Package name substring')
     p.add_argument('--cve', help='Exact vulnerability ID or alias')
@@ -541,8 +628,21 @@ def parse_args(argv=None):
     p.add_argument('--product-map', type=Path, help='CSV with project_id,product columns')
     p.add_argument('--raw-scan-report', action='store_true', help='Also download original ScanReportJson for review')
     p.add_argument('--dump-all', action='store_true',
-                   help='All retained scans and completed SCA reports; project filters allowed, branch/finding filters not')
+                   help='All retained scans and their completed reports; project filters allowed, branch/finding filters not')
     args = p.parse_args(argv)
+    requested = [x.strip().lower() for x in args.scan_types.split(',') if x.strip()]
+    unknown = [x for x in requested if x not in SCAN_TYPES]
+    if not requested or unknown:
+        p.error('--scan-types takes sca and/or containers (container-security)')
+    args.engines = list(dict.fromkeys(SCAN_TYPES[x] for x in requested))
+    if args.project_ids_file:
+        try:
+            from_file = load_project_ids(args.project_ids_file)
+        except (OSError, UnicodeError, csv.Error):
+            p.error('--project-ids-file cannot be read; check the path and that it is a UTF-8 CSV')
+        if not from_file:
+            p.error('--project-ids-file contains no project IDs')
+        args.project_id = (args.project_id or []) + from_file
     if args.dump_all:
         if any([args.branch, args.ecosystems, args.package, args.cve]):
             p.error('--dump-all cannot be combined with --branch or finding filters')
@@ -558,6 +658,8 @@ class Exporter:
         self.raw = out / 'raw'
         self.now = datetime.now(timezone.utc)
         self.matches = finding_filter(args)
+        # --ecosystems describes purl ecosystems, which container results do not carry.
+        self.container_matches = finding_filter(argparse.Namespace(ecosystems='', package=args.package, cve=args.cve))
         self.coverage, self.project_rows = [], []
 
     def run_project(self, project, product_map, apps):
@@ -579,15 +681,18 @@ class Exporter:
         except (ExportError, *RECOVERABLE) as exc:
             self.coverage.append({**context, 'status': 'scan_list_error', 'error': safe_error(exc)})
             return
-        current = {name: chosen['id'] for name, _, chosen in choose_scans(scans) if chosen}
-        selections = all_scan_selections(scans) if self.args.dump_all else choose_scans(scans, self.args.branch)
-        if not selections:
-            self.coverage.append({**context, 'branch': self.args.branch or '', 'status': 'no_scans_in_scope'})
-        for branch, latest, scan in selections:
-            role = 'current' if scan and current.get(branch) == scan['id'] else 'historical'
-            self.coverage.append(self.export_scan({**context, 'branch': branch, 'scan_role': role,
-                'latest_scan_id': latest['id'], 'latest_scan_status': latest.get('status', ''),
-                'runtime_verified': 'not_assessed'}, latest, scan))
+        for engine in self.args.engines:
+            current = {name: chosen['id'] for name, _, chosen in choose_scans(scans, engine=engine) if chosen}
+            selections = (all_scan_selections(scans) if self.args.dump_all
+                          else choose_scans(scans, self.args.branch, engine))
+            if not selections:
+                self.coverage.append({**context, 'scan_type': engine, 'branch': self.args.branch or '',
+                                      'status': 'no_scans_in_scope'})
+            for branch, latest, scan in selections:
+                role = 'current' if scan and current.get(branch) == scan['id'] else 'historical'
+                self.coverage.append(self.export_scan({**context, 'scan_type': engine, 'branch': branch,
+                    'scan_role': role, 'latest_scan_id': latest['id'], 'latest_scan_status': latest.get('status', ''),
+                    'runtime_verified': 'not_assessed'}, latest, scan, engine))
 
     def fetch_scans(self, pid, context):
         scans = []
@@ -602,17 +707,20 @@ class Exporter:
                     'engines_json': encoded(record.get('engines'))}])
         return scans
 
-    def export_scan(self, c, latest, scan):
-        if not scan or not sca_completed(scan):
+    def export_scan(self, c, latest, scan, engine='sca'):
+        if not scan or not engine_completed(scan, engine):
             return {**c, 'scan_id': scan.get('id', '') if scan else '',
                     'scan_date': scan.get('createdAt', '') if scan else '',
                     'scan_tags_json': encoded(scan.get('tags')) if scan else '',
-                    'status': 'no_confirmed_completed_sca'}
+                    'status': f'no_confirmed_completed_{engine}'}
         age = (self.now - parse_date(scan.get('createdAt'))).total_seconds() / 86400
         age_valid = bool(scan.get('createdAt')) and 0 <= age < 365000
         c.update(scan_tags_json=encoded(scan.get('tags')), scan_id=scan['id'], scan_date=scan.get('createdAt', ''),
                  scan_age_days=round(age, 1) if age_valid else '',
                  newer_scan_than_selected=latest['id'] != scan['id'])
+        fresh = 'exported' if age_valid and age <= self.args.stale_days else 'stale_or_unknown_date'
+        if engine == 'containers':
+            return self.export_containers(c, scan, fresh)
         stem = file_stem(scan['id'])
         errors = []
         try:
@@ -623,8 +731,7 @@ class Exporter:
             self.csv['packages'].write(pkgs)
             self.csv['findings'].write(vulns)
             self.csv['matches'].write(r for r in vulns if self.matches(r))
-            c.update(status='exported' if age_valid and age <= self.args.stale_days else 'stale_or_unknown_date',
-                     vulnerability_section=section, package_count=len(pkgs), finding_count=len(vulns),
+            c.update(status=fresh, vulnerability_section=section, package_count=len(pkgs), finding_count=len(vulns),
                      unresolved_links=unresolved)
         except (ExportError, *RECOVERABLE) as exc:
             errors.append('CycloneDxJson: ' + safe_error(exc))
@@ -636,6 +743,23 @@ class Exporter:
                 errors.append('ScanReportJson: ' + safe_error(exc))
         if errors:
             c.update(status='export_error', error='; '.join(errors))
+        return c
+
+    def export_containers(self, c, scan, fresh):
+        try:
+            results = self.client.results(scan['id'])
+            containers = [r for r in results if str(r.get('type', '')).lower() == 'containers']
+            # Original container result records, unmodified; other engines' results are left out.
+            (self.raw / f'{file_stem(scan["id"])}.containers.json').write_text(
+                encoded({'scanId': scan['id'], 'results': containers}), encoding='utf-8')
+            rows = container_findings(containers, {k: c.get(k, '') for k in BASE})
+            self.csv['container_findings'].write(rows)
+            self.csv['container_matches'].write(r for r in rows if self.container_matches(r))
+            c.update(status=fresh, vulnerability_section='present', finding_count=len(rows),
+                     package_count=len({(r['image_name'], r['image_tag'], r['package'], r['version']) for r in rows}),
+                     unresolved_links=0)
+        except (ExportError, *RECOVERABLE) as exc:
+            c.update(status='export_error', error='Containers results: ' + safe_error(exc))
         return c
 
 
@@ -671,6 +795,12 @@ def main(argv=None):
     projects = [x for x in client.pages('/api/projects', 'projects') if selected(x)]
     if not projects:
         raise ExportError('No visible projects matched; check filters and account permissions')
+    missing = sorted(set(project_ids(args)) - {str(x['id']).lower() for x in projects})
+    if missing:
+        # Mistyped, deleted, outside the API identity's permissions, or excluded by other filters.
+        print(f'WARNING: {len(missing)} --project-id value(s) not exported: {", ".join(missing)}', file=sys.stderr)
+        metadata_errors.append({'stage': 'project_ids', 'error': 'Not visible or excluded by other filters',
+                                'project_ids': missing})
     (out / 'raw' / 'applications.json').write_text(encoded(applications), encoding='utf-8')
     (out / 'raw' / 'projects.json').write_text(encoded(projects), encoding='utf-8')
     write_csv(out / 'applications.csv', (dict(application_id=a['id'], application=a.get('name', ''),
@@ -681,7 +811,8 @@ def main(argv=None):
     with contextlib.ExitStack() as stack:
         csvs = {}
         for name, fields in [('application_projects', LINK_FIELDS), ('scans', SCAN_FIELDS),
-                             ('packages', PKG), ('findings', FIND), ('matches', FIND)]:
+                             ('packages', PKG), ('findings', FIND), ('matches', FIND),
+                             ('container_findings', CONTAINER), ('container_matches', CONTAINER)]:
             csvs[name] = CsvWriter(out / f'{name}.csv', fields)
             stack.callback(csvs[name].close)
         exporter = Exporter(client, args, out, csvs)
@@ -692,11 +823,14 @@ def main(argv=None):
     write_csv(out / 'coverage.csv', exporter.coverage, COVER)
 
     summary = {'generated_at': exporter.now.isoformat(), 'visible_projects_in_scope': len(projects),
+               'scan_types': args.engines,
                'packages': csvs['packages'].count, 'finding_rows': csvs['findings'].count,
+               'container_finding_rows': csvs['container_findings'].count,
                'filters': {'ecosystems': args.ecosystems, 'package': args.package, 'cve': args.cve},
-               'project_filters': {'project': args.project, 'tag': args.tag, 'application': args.application,
+               'project_filters': {'project_id': project_ids(args) or None, 'project': args.project, 'tag': args.tag, 'application': args.application,
                                    'group': args.group, 'branch': args.branch},
-               'scope': 'All retained scans; completed SCA reports' if args.dump_all else 'Latest confirmed completed SCA scan per observed branch',
+               'scope': ('All retained scans; completed reports per scan type' if args.dump_all
+                         else 'Latest confirmed completed scan per scan type and observed branch'),
                'metadata_errors': metadata_errors, 'visible_applications': len(applications),
                'scan_records': csvs['scans'].count,
                'metadata_time_basis': 'Application associations and project/application tags are current at export, not historical',
@@ -707,7 +841,8 @@ def main(argv=None):
     (out / 'run.json').write_text(json.dumps(summary, indent=2), encoding='utf-8')
     incomplete = (bool(metadata_errors) or any(coverage_gap(r) for r in exporter.coverage)
                   or any(r['application_mapping_status'] == 'partial_or_unknown' for r in exporter.project_rows))
-    print(f'Saved {csvs["packages"].count} packages, {csvs["findings"].count} finding rows. '
+    print(f'Saved {csvs["packages"].count} packages, {csvs["findings"].count} SCA finding rows, '
+          f'{csvs["container_findings"].count} container finding rows. '
           f'Review coverage.csv. Output: {out.resolve()}')
     return 2 if incomplete else 0
 
