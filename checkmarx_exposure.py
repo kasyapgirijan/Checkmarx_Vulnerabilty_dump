@@ -524,7 +524,7 @@ def parse_args(argv=None):
     p.add_argument('--out', default='checkmarx-output')
     p.add_argument('--config', type=Path, help='INI path; default config.ini beside this script, then environment fallback')
     p.add_argument('--insecure', action='store_true',
-                   help='Disable TLS certificate verification (prefer verify_ssl = /path/to/ca.pem)')
+                   help='Turn off all SSL checks for this run (same as verify_ssl = false)')
     p.add_argument('--project', help='Case-insensitive project name substring')
     p.add_argument('--tag', action='append', metavar='KEY[=VALUE]',
                    help='Project tag key, or exact key=value; repeat for alternatives (case-insensitive)')
