@@ -22,9 +22,17 @@ class Tests(unittest.TestCase):
         self.assertEqual(findings[0]['severity'], 'high')
         self.assertEqual(findings[0]['analysis_state'], 'not_affected')
         self.assertEqual((status, unresolved), ('present', 0))
-        args = argparse.Namespace(ecosystems='python', package='django', cve='cve-test-1')
-        self.assertFalse(cx.matches(findings[0], args))
-        self.assertTrue(cx.matches(findings[1], args))
+        matches = cx.finding_filter(argparse.Namespace(ecosystems='python', package='django', cve='cve-test-1'))
+        self.assertFalse(matches(findings[0]))
+        self.assertTrue(matches(findings[1]))
+        everything = cx.finding_filter(argparse.Namespace(ecosystems='', package=None, cve=None))
+        self.assertTrue(all(everything(f) for f in findings))
+
+    def test_null_optional_fields(self):
+        b = bom()
+        b['vulnerabilities'][0].update(analysis=None, source=None, references=None, ratings=None)
+        finding = cx.flatten(b, {})[1][0]
+        self.assertEqual((finding['analysis_state'], finding['severity']), ('', 'unknown'))
 
     def test_unknown_is_not_clean(self):
         b = bom()
@@ -57,18 +65,56 @@ class Tests(unittest.TestCase):
         client.api = Mock(side_effect=[{'projects': [{'id': '1'}]}, {'projects': [{'id': '1'}]}])
         with self.assertRaises(cx.ExportError):
             list(client.pages('/api/projects', 'projects'))
+        # A record inserted during paging shifts the next page; repeats are skipped.
+        client.api = Mock(side_effect=[{'scans': [{'id': '1'}, {'id': '2'}]},
+                                       {'scans': [{'id': '2'}, {'id': '3'}], 'filteredTotalCount': 4}])
+        self.assertEqual([s['id'] for s in client.pages('/api/scans', 'scans')], ['1', '2', '3'])
+        self.assertEqual(client.api.call_count, 2)  # Stops at filteredTotalCount.
+
+    @staticmethod
+    def response(status, body=None, headers=None):
+        content = body if isinstance(body, bytes) else cx.json.dumps(body).encode()
+        return Mock(status_code=status, content=content, headers=headers or {})
+
+    def export_client(self, responses):
+        client = cx.Client.__new__(cx.Client)
+        client.base = 'https://eu.ast.checkmarx.net'
+        client.send = Mock(side_effect=responses)
+        client.download = Mock()
+        return client
 
     @patch('checkmarx_exposure.time.sleep')
-    def test_export_polling_and_download_without_credentials(self, sleep):
-        client = cx.Client.__new__(cx.Client)
-        client.api = Mock(side_effect=[{'exportId': 'x'}, {'exportStatus': 'Pending'},
-            {'exportStatus': 'Completed', 'fileUrl': 'https://example.com/report?signature=secret'}])
-        client.download = Mock()
-        client.download.get.return_value = Mock(status_code=200)
-        client.download.get.return_value.json.return_value = bom()
-        self.assertEqual(client.export('scan', 'CycloneDxJson', 10), bom())
+    def test_export_polling_and_authenticated_download(self, sleep):
+        r = self.response
+        report = b'\xef\xbb\xbf' + cx.json.dumps(bom()).encode()
+        client = self.export_client([r(400, {}), r(202, {'exportId': 'x/1'}), r(404, {}),
+            r(200, {'exportStatus': 'Exporting'}), r(200, {'exportStatus': 'Completed', 'fileUrl': 'ignored'}),
+            r(200, report)])
+        content = client.export('scan', 'CycloneDxJson', 60)
+        self.assertEqual(cx.decode_json(content, 'x'), bom())  # BOM is tolerated.
+        self.assertEqual(client.send.call_args_list[0].args, ('POST', '/api/sca/export/requests'))
+        self.assertEqual(client.send.call_args_list[0].kwargs['json']['ScanID'], 'scan')
+        self.assertEqual(client.send.call_args.args, ('GET', '/api/sca/export/requests/x%2F1/download'))
+        client.download.get.assert_not_called()
+
+    @patch('checkmarx_exposure.time.sleep')
+    def test_export_failure_and_offhost_redirect(self, sleep):
+        r = self.response
+        client = self.export_client([r(202, {'exportId': 'x'}),
+                                     r(200, {'exportStatus': 'Failed', 'errorMessage': 'no results'})])
+        with self.assertRaisesRegex(cx.ExportError, 'no results'):
+            client.export('scan', 'CycloneDxJson', 60)
+        client = self.export_client([r(202, {'exportId': 'x'}), r(200, {'exportStatus': 'Completed'}),
+                                     r(302, b'', {'Location': 'https://storage.example.com/r?sig=secret'})])
+        client.download.get.return_value = r(200, b'{}')
+        self.assertEqual(client.export('scan', 'CycloneDxJson', 60), b'{}')
         self.assertNotIn('headers', client.download.get.call_args.kwargs)
         self.assertFalse(client.download.get.call_args.kwargs['allow_redirects'])
+
+    def test_api_key_client_id(self):
+        claims = cx.base64.urlsafe_b64encode(b'{"azp":"custom-app"}').decode().rstrip('=')
+        self.assertEqual(cx.token_client_id('h.' + claims + '.s'), 'custom-app')
+        self.assertEqual(cx.token_client_id('not-a-jwt'), 'ast-app')
 
     def test_csv_formula_safety(self):
         with tempfile.TemporaryDirectory() as d:
@@ -79,10 +125,10 @@ class Tests(unittest.TestCase):
     def test_application_links_and_tags(self):
         apps = [{'id': 'a', 'name': 'Alpha', 'projectIds': ['p'], 'tags': {'owner': 'team'}},
                 {'id': 'b', 'name': 'Beta', 'projectIds': ['p'], 'tags': {}}]
-        result = cx.application_context({'id': 'p', 'tags': {'release': '1'}}, apps, True)
+        result = cx.application_context({'id': 'p', 'tags': {'release': '1'}}, cx.ApplicationIndex(apps))
         self.assertEqual(cx.json.loads(result['application_ids_json']), ['a', 'b'])
         self.assertEqual(result['application_mapping_status'], 'resolved')
-        result = cx.application_context({'id': 'p', 'applicationIds': ['missing']}, [], False)
+        result = cx.application_context({'id': 'p', 'applicationIds': ['missing']}, cx.ApplicationIndex([], False))
         self.assertEqual(result['application_mapping_status'], 'partial_or_unknown')
 
     @patch('checkmarx_exposure.Client')
@@ -94,24 +140,38 @@ class Tests(unittest.TestCase):
                  {'id': 's2', 'branch': 'main', 'createdAt': '2026-10-02T00:00:00Z',
                   'statusDetails': [{'name': 'sca', 'status': 'Failed'}]},
                  {'id': 's3', 'branch': 'main', 'createdAt': '2026-10-03T00:00:00Z',
-                  'statusDetails': [{'name': 'sca', 'status': 'Completed'}]}]
+                  'statusDetails': [{'name': 'sca', 'status': 'Completed'}]},
+                 {'id': 's4', 'branch': 'main', 'createdAt': '2026-10-04T00:00:00Z',
+                  'statusDetails': [{'name': 'sca', 'status': 'Failed'}]}]
         def pages(path, key, **kwargs):
             return iter({'projects': [{'id': 'p', 'name': 'Project', 'tags': {'owner': 'X'}}],
                          'applications': [{'id': 'a', 'name': 'App', 'projectIds': ['p'], 'tags': {'tier': '1'}}],
                          'scans': scans}[key])
         client.pages.side_effect = pages
-        client.export.side_effect = lambda sid, fmt, timeout: bom() if fmt == 'CycloneDxJson' else {'Packages': []}
+        client.export.side_effect = lambda sid, fmt, timeout: (
+            cx.json.dumps(bom()).encode() if fmt == 'CycloneDxJson' else b'{"Packages": []}')
         with tempfile.TemporaryDirectory() as tmp:
             out = Path(tmp) / 'dump'
-            with patch('sys.argv', ['script', '--dump-all', '--out', str(out)]):
-                self.assertEqual(cx.main(), 2)  # Failed SCA is explicit coverage gap.
+            # Newest scan (s4) failed SCA, so the current evidence is flagged for review.
+            self.assertEqual(cx.main(['--dump-all', '--out', str(out)]), 2)
             self.assertEqual(client.export.call_count, 4)
             with (out / 'packages.csv').open(encoding='utf-8-sig') as f:
                 rows = list(csv.DictReader(f))
             self.assertEqual(len(rows), 4)
             self.assertEqual(cx.json.loads(rows[0]['application_names_json']), {'a': 'App'})
             self.assertTrue((out / 'applications.csv').exists())
-            self.assertEqual(len((out / 'raw' / 'scans-p.jsonl').read_text().splitlines()), 3)
+            self.assertEqual(len((out / 'raw' / 'scans-p.jsonl').read_text().splitlines()), 4)
+            with (out / 'coverage.csv').open(encoding='utf-8-sig') as f:
+                roles = {r['scan_id']: r['scan_role'] for r in csv.DictReader(f)}
+            self.assertEqual(roles, {'s4': 'historical', 's3': 'current', 's2': 'historical', 's1': 'historical'})
+
+    def test_coverage_gap(self):
+        current = {'scan_role': 'current', 'status': 'exported', 'vulnerability_section': 'present',
+                   'unresolved_links': 0, 'newer_scan_than_selected': False}
+        self.assertFalse(cx.coverage_gap(current))
+        self.assertTrue(cx.coverage_gap({**current, 'newer_scan_than_selected': True}))
+        self.assertFalse(cx.coverage_gap({**current, 'scan_role': 'historical', 'status': 'stale_or_unknown_date'}))
+        self.assertTrue(cx.coverage_gap({**current, 'scan_role': 'historical', 'status': 'export_error'}))
 
     @patch.dict('os.environ', {}, clear=True)
     def test_ini_config_and_precedence(self):
