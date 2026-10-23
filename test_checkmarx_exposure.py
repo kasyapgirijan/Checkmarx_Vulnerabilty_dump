@@ -175,7 +175,8 @@ class Tests(unittest.TestCase):
                     {'id': 'p2', 'name': 'web', 'tags': {'team': 'red'}, 'applicationIds': ['a2'], 'groups': []},
                     {'id': 'p3', 'name': 'tool', 'tags': None}]
         def pick(**kw):
-            args = argparse.Namespace(**{'project': None, 'tag': None, 'application': None, 'group': None, **kw})
+            args = argparse.Namespace(**{'project': None, 'tag': None, 'application': None, 'group': None,
+                                         'project_id': None, **kw})
             return [p['id'] for p in projects if cx.project_filter(args, apps)(p)]
         self.assertEqual(pick(), ['p1', 'p2', 'p3'])
         self.assertEqual(pick(tag=['team=blue']), ['p1'])
@@ -186,6 +187,79 @@ class Tests(unittest.TestCase):
         self.assertEqual(pick(application=['a2']), ['p2'])  # By ID from project applicationIds.
         self.assertEqual(pick(group=['G-EU']), ['p1'])
         self.assertEqual(pick(project='WEB', tag=['team=blue']), [])
+        self.assertEqual(pick(project_id=['P2,p3']), ['p2', 'p3'])  # Exact IDs, case-insensitive.
+
+    def test_results_paging_like_ast_cli(self):
+        client = cx.Client.__new__(cx.Client)
+        with patch.object(cx, 'RESULTS_PAGE_SIZE', 2):
+            client.api = Mock(side_effect=[
+                {'results': [{'id': 'a'}, {'id': 'b'}], 'totalCount': 3}, {'results': [{'id': 'c'}], 'totalCount': 3}])
+            self.assertEqual([r['id'] for r in client.results('s')], ['a', 'b', 'c'])
+            params = client.api.call_args_list[1].kwargs['params']
+            self.assertEqual((params['scan-id'], params['offset'], params['limit']), ('s', 1, 2))  # Page number.
+            client.api = Mock(side_effect=[{'results': [{'id': 'a'}, {'id': 'b'}], 'totalCount': 9},
+                                           {'results': [{'id': 'a'}, {'id': 'b'}], 'totalCount': 9}])
+            with self.assertRaises(cx.ExportError):
+                client.results('s')
+        client.api = Mock(return_value={'totalCount': 0})
+        self.assertEqual(client.results('s'), [])
+
+    def test_container_findings(self):
+        results = [{'type': 'sast', 'id': 'x'},
+                   {'type': 'containers', 'id': 'r1', 'severity': 'HIGH', 'state': 'TO_VERIFY', 'status': 'NEW',
+                    'data': {'packageName': 'openssl', 'packageVersion': '1.1', 'imageName': 'nginx',
+                             'imageTag': '1.25', 'imageFilePath': 'Dockerfile', 'queryName': 'CVE-1'},
+                    'vulnerabilityDetails': {'cveName': 'CVE-1', 'cvssScore': 7.5, 'cweId': 'CWE-1'}}]
+        rows = cx.container_findings(results, {'project': 'P'})
+        self.assertEqual(len(rows), 1)
+        self.assertEqual((rows[0]['image_name'], rows[0]['package'], rows[0]['vulnerability'], rows[0]['severity']),
+                         ('nginx', 'openssl', 'CVE-1', 'high'))
+
+    @patch('checkmarx_exposure.Client')
+    def test_containers_only_end_to_end(self, constructor):
+        import csv
+        client = constructor.return_value
+        client.verify = True
+        scans = [{'id': 's1', 'branch': 'main', 'createdAt': '2026-10-01T00:00:00Z',
+                  'statusDetails': [{'name': 'sca', 'status': 'Completed'}, {'name': 'containers', 'status': 'Completed'}]},
+                 {'id': 's2', 'branch': 'main', 'createdAt': '2026-10-02T00:00:00Z',
+                  'statusDetails': [{'name': 'containers', 'status': 'Failed'}]}]
+        def pages(path, key, **kwargs):
+            return iter({'projects': [{'id': 'P1', 'name': 'One'}, {'id': 'p2', 'name': 'Two'}],
+                         'applications': [], 'scans': scans}[key])
+        client.pages.side_effect = pages
+        client.results.return_value = [{'type': 'containers', 'id': 'r', 'data': {'packageName': 'zlib'},
+                                        'vulnerabilityDetails': {'cveName': 'CVE-2'}}, {'type': 'sca', 'id': 'q'}]
+        with tempfile.TemporaryDirectory() as tmp:
+            ids = Path(tmp) / 'ids.csv'
+            ids.write_text('Project ID,name\n\np1,One\nmissing,Gone\n', encoding='utf-8')
+            out = Path(tmp) / 'out'
+            self.assertEqual(cx.main(['--scan-types', 'container-security', '--project-ids-file', str(ids),
+                                      '--out', str(out)]), 2)  # Unknown ID and newer failed scan are flagged.
+            client.export.assert_not_called()
+            client.results.assert_called_once_with('s1')
+            with (out / 'container_findings.csv').open(encoding='utf-8-sig') as f:
+                rows = list(csv.DictReader(f))
+            self.assertEqual([(r['project_id'], r['package']) for r in rows], [('P1', 'zlib')])
+            with (out / 'coverage.csv').open(encoding='utf-8-sig') as f:
+                cover = list(csv.DictReader(f))
+            self.assertEqual([(r['scan_type'], r['scan_id'], r['newer_scan_than_selected']) for r in cover],
+                             [('containers', 's1', 'True')])
+            self.assertTrue((out / 'raw' / 's1.containers.json').exists())
+            summary = cx.json.loads((out / 'run.json').read_text())
+            self.assertEqual(summary['metadata_errors'][0]['project_ids'], ['missing'])
+
+    def test_scan_types_and_project_ids_args(self):
+        self.assertEqual(cx.parse_args([]).engines, ['sca'])
+        self.assertEqual(cx.parse_args(['--scan-types', 'SCA,containers,container']).engines, ['sca', 'containers'])
+        with self.assertRaises(SystemExit), patch('sys.stderr'):
+            cx.parse_args(['--scan-types', 'sast'])
+        with tempfile.TemporaryDirectory() as tmp:
+            plain = Path(tmp) / 'plain.csv'
+            plain.write_text('\ufeffaaa\n\n bbb ,x\n', encoding='utf-8')
+            self.assertEqual(cx.load_project_ids(plain), ['aaa', 'bbb'])
+            args = cx.parse_args(['--project-id', 'c,d', '--project-ids-file', str(plain)])
+            self.assertEqual(cx.project_ids(args), ['c', 'd', 'aaa', 'bbb'])
 
     def test_coverage_gap(self):
         current = {'scan_role': 'current', 'status': 'exported', 'vulnerability_section': 'present',
