@@ -236,6 +236,18 @@ class Tests(unittest.TestCase):
         self.assertIs(client.http.post.call_args.kwargs['verify'], False)
         self.assertIs(client.http.request.call_args.kwargs['verify'], False)
 
+    def test_connection_errors_are_diagnosable_but_redacted(self):
+        exc = cx.requests.exceptions.SSLError(
+            "HTTPSConnectionPool(host='eu.ast.checkmarx.net', port=443): Max retries exceeded with url: "
+            "/r?sig=SECRET (Caused by SSLError(SSLCertVerificationError('certificate verify failed')))")
+        text = cx.safe_error(exc)
+        self.assertIn('certificate verify failed', text)
+        self.assertIn('eu.ast.checkmarx.net', text)
+        self.assertNotIn('SECRET', text)
+        proxy = cx.safe_error(cx.requests.exceptions.ProxyError('Cannot connect to proxy http://bob:pw@proxy:8080'))
+        self.assertNotIn('pw', proxy)
+        self.assertEqual(cx.safe_error(KeyError('x')), 'KeyError')
+
     def test_https(self):
         for url in ['http://example.com', 'https://user:password@example.com']:
             with self.assertRaises(cx.ExportError):

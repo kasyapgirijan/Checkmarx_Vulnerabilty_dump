@@ -179,6 +179,16 @@ disabled`. Without verification, anyone able to intercept the traffic can captur
 your API key and the exported vulnerability data, so rotate the key if the
 network later turns out to be untrusted.
 
+If an SSL error persists with `verify_ssl = false`:
+- No `WARNING: TLS certificate verification is disabled` line at startup means the
+  setting was not applied: check you are running this version of the script, that
+  the line is under `[checkmarx]` in the config actually used, and that
+  CX_VERIFY_SSL is not set to another value (environment values win).
+- Errors print the underlying reason (paths and secrets redacted). Reasons other than
+  `CERTIFICATE_VERIFY_FAILED`, such as `UNSAFE_LEGACY_RENEGOTIATION_DISABLED`,
+  `WRONG_VERSION_NUMBER` or a `ProxyError`, are handshake or proxy problems that
+  disabling verification cannot fix; check HTTPS_PROXY/NO_PROXY with your network team.
+
 ## Run
 
 Start with one product to validate access and output:

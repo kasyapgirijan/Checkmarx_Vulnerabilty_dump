@@ -7,6 +7,7 @@ import contextlib
 import csv
 import json
 import os
+import re
 import sys
 import time
 import warnings
@@ -40,7 +41,16 @@ class ExportError(Exception):
 
 def safe_error(exc):
     # requests exception text can contain signed URLs or tokens; never log/CSV it.
-    return str(exc) if isinstance(exc, ExportError) else type(exc).__name__
+    if isinstance(exc, ExportError):
+        return str(exc)
+    if isinstance(exc, requests.ConnectionError):  # Includes SSLError and ProxyError.
+        # Keep host and the underlying reason (needed to diagnose TLS/proxy problems),
+        # but drop request paths, query strings and proxy credentials.
+        text = re.sub(r'url: \S+', 'url: <redacted>', str(exc))
+        text = re.sub(r'\?[^\s\'"]*', '', text)
+        text = re.sub(r'//[^/\s@]+@', '//', text)
+        return f'{type(exc).__name__}: {text[:400]}'
+    return type(exc).__name__
 
 
 def https_url(value):
