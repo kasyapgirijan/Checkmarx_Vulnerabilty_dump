@@ -36,6 +36,9 @@ New exports:
 | raw/projects.json | Original project list records |
 | raw/scans-PROJECT_ID.jsonl | Original scan records, saved as retrieved |
 
+Every scans, packages, findings, matches, coverage and projects row carries the
+project name (`project`) and its application names (`applications`, plain text
+separated by `; `, empty when unassigned) for easy filtering in Excel/Power BI.
 Application IDs/names/tags and project/scan tags also accompany package and finding
 rows. Tags stay as JSON to preserve keys, empty values and differing tags at each
 level. Application name/tag objects are keyed by application ID; memberships do

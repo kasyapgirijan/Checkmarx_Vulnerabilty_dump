@@ -128,6 +128,7 @@ class Tests(unittest.TestCase):
         result = cx.application_context({'id': 'p', 'tags': {'release': '1'}}, cx.ApplicationIndex(apps))
         self.assertEqual(cx.json.loads(result['application_ids_json']), ['a', 'b'])
         self.assertEqual(result['application_mapping_status'], 'resolved')
+        self.assertEqual(result['applications'], 'Alpha; Beta')
         result = cx.application_context({'id': 'p', 'applicationIds': ['missing']}, cx.ApplicationIndex([], False))
         self.assertEqual(result['application_mapping_status'], 'partial_or_unknown')
 
@@ -159,6 +160,7 @@ class Tests(unittest.TestCase):
                 rows = list(csv.DictReader(f))
             self.assertEqual(len(rows), 4)
             self.assertEqual(cx.json.loads(rows[0]['application_names_json']), {'a': 'App'})
+            self.assertEqual((rows[0]['project'], rows[0]['applications']), ('Project', 'App'))
             self.assertTrue((out / 'applications.csv').exists())
             self.assertEqual(len((out / 'raw' / 'scans-p.jsonl').read_text().splitlines()), 4)
             with (out / 'coverage.csv').open(encoding='utf-8-sig') as f:

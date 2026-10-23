@@ -323,11 +323,11 @@ def flatten(bom, context):
 
 
 META = ['application_ids_json', 'application_names_json', 'application_tags_json', 'application_mapping_status', 'project_tags_json', 'scan_tags_json']
-BASE = META + ['product', 'product_mapping', 'project', 'project_id', 'branch', 'scan_id', 'scan_date', 'scan_age_days']
+BASE = META + ['product', 'product_mapping', 'project', 'applications', 'project_id', 'branch', 'scan_id', 'scan_date', 'scan_age_days']
 PKG = BASE + ['component_ref', 'package', 'version', 'ecosystem', 'purl', 'scope', 'component_type', 'runtime_verified']
 FIND = PKG + ['vulnerability', 'aliases', 'severity', 'ratings_json', 'analysis_state', 'recommendation', 'affected_versions_json', 'source_url', 'package_link_status']
 COVER = BASE + ['scan_role', 'status', 'latest_scan_id', 'latest_scan_status', 'newer_scan_than_selected', 'vulnerability_section', 'package_count', 'finding_count', 'unresolved_links', 'runtime_verified', 'error']
-PROJECT_FIELDS = ['project_id', 'project', 'product', 'product_mapping', 'main_branch', 'repo_url'] + META
+PROJECT_FIELDS = ['project_id', 'project', 'applications', 'product', 'product_mapping', 'main_branch', 'repo_url'] + META
 LINK_FIELDS = ['application_id', 'application', 'project_id', 'project', 'application_tags_json', 'project_tags_json']
 SCAN_FIELDS = BASE + ['status', 'status_details_json', 'engines_json']
 APP_FIELDS = ['application_id', 'application', 'tags_json', 'project_ids_json', 'description', 'criticality']
@@ -403,7 +403,10 @@ def application_context(project, index):
     # Absence of association fields is a schema gap, not proof of no association.
     schema_known = 'applicationIds' in project or (index.complete and index.all_have_project_ids)
     status = ('resolved' if ids else 'unassigned') if complete and schema_known else 'partial_or_unknown'
-    return {'application_ids_json': encoded(ids),
+    # Readable names for spreadsheets; the *_json columns stay authoritative (names can repeat).
+    names = sorted(str(a.get('name') or i) for i, a in apps.items())
+    return {'applications': '; '.join(names),
+            'application_ids_json': encoded(ids),
             'application_names_json': encoded({i: a.get('name', '') for i, a in apps.items()}),
             'application_tags_json': encoded({i: a.get('tags') for i, a in apps.items()}),
             'application_mapping_status': status,
