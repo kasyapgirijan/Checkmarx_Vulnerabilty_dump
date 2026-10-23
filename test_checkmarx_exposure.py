@@ -169,6 +169,24 @@ class Tests(unittest.TestCase):
                 roles = {r['scan_id']: r['scan_role'] for r in csv.DictReader(f)}
             self.assertEqual(roles, {'s4': 'historical', 's3': 'current', 's2': 'historical', 's1': 'historical'})
 
+    def test_project_filters(self):
+        apps = cx.ApplicationIndex([{'id': 'a1', 'name': 'Payments', 'projectIds': ['p1']}])
+        projects = [{'id': 'p1', 'name': 'pay-api', 'tags': {'Team': 'Blue', 'pci': ''}, 'groups': ['g-eu']},
+                    {'id': 'p2', 'name': 'web', 'tags': {'team': 'red'}, 'applicationIds': ['a2'], 'groups': []},
+                    {'id': 'p3', 'name': 'tool', 'tags': None}]
+        def pick(**kw):
+            args = argparse.Namespace(**{'project': None, 'tag': None, 'application': None, 'group': None, **kw})
+            return [p['id'] for p in projects if cx.project_filter(args, apps)(p)]
+        self.assertEqual(pick(), ['p1', 'p2', 'p3'])
+        self.assertEqual(pick(tag=['team=blue']), ['p1'])
+        self.assertEqual(pick(tag=['TEAM']), ['p1', 'p2'])  # Key only, any value.
+        self.assertEqual(pick(tag=['pci']), ['p1'])  # Key-only tag with empty value.
+        self.assertEqual(pick(tag=['team=blue', 'team=red']), ['p1', 'p2'])  # Repeats are OR.
+        self.assertEqual(pick(tag=['team'], application=['payments']), ['p1'])  # Types are AND.
+        self.assertEqual(pick(application=['a2']), ['p2'])  # By ID from project applicationIds.
+        self.assertEqual(pick(group=['G-EU']), ['p1'])
+        self.assertEqual(pick(project='WEB', tag=['team=blue']), [])
+
     def test_coverage_gap(self):
         current = {'scan_role': 'current', 'status': 'exported', 'vulnerability_section': 'present',
                    'unresolved_links': 0, 'newer_scan_than_selected': False}

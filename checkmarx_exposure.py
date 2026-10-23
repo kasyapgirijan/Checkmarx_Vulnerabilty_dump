@@ -394,7 +394,7 @@ BASE = META + ['product', 'product_mapping', 'project', 'applications', 'project
 PKG = BASE + ['component_ref', 'package', 'version', 'ecosystem', 'purl', 'scope', 'component_type', 'runtime_verified']
 FIND = PKG + ['vulnerability', 'aliases', 'severity', 'ratings_json', 'analysis_state', 'recommendation', 'affected_versions_json', 'source_url', 'package_link_status']
 COVER = BASE + ['scan_role', 'status', 'latest_scan_id', 'latest_scan_status', 'newer_scan_than_selected', 'vulnerability_section', 'package_count', 'finding_count', 'unresolved_links', 'runtime_verified', 'error']
-PROJECT_FIELDS = ['project_id', 'project', 'applications', 'product', 'product_mapping', 'main_branch', 'repo_url'] + META
+PROJECT_FIELDS = ['project_id', 'project', 'applications', 'product', 'product_mapping', 'main_branch', 'repo_url', 'groups_json'] + META
 LINK_FIELDS = ['application_id', 'application', 'project_id', 'project', 'application_tags_json', 'project_tags_json']
 SCAN_FIELDS = BASE + ['status', 'status_details_json', 'engines_json']
 APP_FIELDS = ['application_id', 'application', 'tags_json', 'project_ids_json', 'description', 'criticality']
@@ -480,6 +480,30 @@ def application_context(project, index):
             'project_tags_json': encoded(project.get('tags'))}
 
 
+def project_filter(args, apps):
+    """Project selection: each option type must match (AND); repeats of one option are alternatives (OR)."""
+    def fold(values):
+        return [v.strip().lower() for v in values or [] if v.strip()]
+    tags = [tuple(t.split('=', 1)) if '=' in t else (t, None) for t in fold(args.tag)]
+    wanted_apps, groups = fold(args.application), fold(args.group)
+
+    def tag_match(project):
+        have = {str(k).lower(): str(v or '').lower() for k, v in (project.get('tags') or {}).items()}
+        return any(k in have and (v is None or have[k] == v) for k, v in tags)
+
+    def app_match(project):
+        ids = set(project.get('applicationIds') or []) | apps.by_project.get(project['id'], set())
+        names = {str(i).lower() for i in ids} | {str(apps.by_id[i].get('name', '')).lower() for i in ids if i in apps.by_id}
+        return bool(names & set(wanted_apps))
+
+    def matches(project):
+        return ((not args.project or args.project.lower() in project['name'].lower()) and
+                (not tags or tag_match(project)) and
+                (not wanted_apps or app_match(project)) and
+                (not groups or bool({str(g).lower() for g in project.get('groups') or []} & set(groups))))
+    return matches
+
+
 def file_stem(identifier):
     # Sanitize IDs for local filenames; the actual ID is preserved in CSV context.
     return ''.join(ch if ch.isalnum() or ch in '-_' else '_' for ch in str(identifier))
@@ -502,6 +526,12 @@ def parse_args(argv=None):
     p.add_argument('--insecure', action='store_true',
                    help='Disable TLS certificate verification (prefer verify_ssl = /path/to/ca.pem)')
     p.add_argument('--project', help='Case-insensitive project name substring')
+    p.add_argument('--tag', action='append', metavar='KEY[=VALUE]',
+                   help='Project tag key, or exact key=value; repeat for alternatives (case-insensitive)')
+    p.add_argument('--application', action='append', metavar='NAME_OR_ID',
+                   help='Exact application name or ID; repeat for alternatives (case-insensitive)')
+    p.add_argument('--group', action='append', metavar='GROUP',
+                   help='Project group as returned by the API; repeat for alternatives (case-insensitive)')
     p.add_argument('--branch', help='Exact branch; default: latest completed SCA for each observed branch')
     p.add_argument('--ecosystems', default='', help='Comma-separated purl ecosystems; npm,pypi (or nodejs,python). Default all')
     p.add_argument('--package', help='Package name substring')
@@ -510,11 +540,12 @@ def parse_args(argv=None):
     p.add_argument('--export-timeout', type=int, default=600, help='Seconds allowed per report export')
     p.add_argument('--product-map', type=Path, help='CSV with project_id,product columns')
     p.add_argument('--raw-scan-report', action='store_true', help='Also download original ScanReportJson for review')
-    p.add_argument('--dump-all', action='store_true', help='All visible projects, retained scans and completed SCA reports; no filters')
+    p.add_argument('--dump-all', action='store_true',
+                   help='All retained scans and completed SCA reports; project filters allowed, branch/finding filters not')
     args = p.parse_args(argv)
     if args.dump_all:
-        if any([args.project, args.branch, args.ecosystems, args.package, args.cve]):
-            p.error('--dump-all cannot be combined with scope or finding filters')
+        if any([args.branch, args.ecosystems, args.package, args.cve]):
+            p.error('--dump-all cannot be combined with --branch or finding filters')
         args.raw_scan_report = True
     if args.stale_days < 0 or args.export_timeout <= 0:
         p.error('stale-days must be >= 0 and export-timeout > 0')
@@ -535,6 +566,7 @@ class Exporter:
                    'product_mapping': 'explicit' if pid in product_map else 'project_name_fallback',
                    'project': project['name'], 'project_id': pid, **application_context(project, apps)}
         self.project_rows.append({**context, 'main_branch': project.get('mainBranch', ''),
+                                  'groups_json': encoded(project.get('groups')),
                                   'repo_url': project.get('repoUrl', '')})
         self.csv['application_projects'].write(
             {'project_id': pid, 'project': project['name'], 'application_id': aid,
@@ -624,18 +656,21 @@ def main(argv=None):
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=False)  # Separate evidence per run; do not mix old/new exports.
     (out / 'raw').mkdir()
-    projects = [x for x in client.pages('/api/projects', 'projects')
-                if not args.project or args.project.lower() in x['name'].lower()]
-    if not projects:
-        raise ExportError('No visible projects matched; check filter and account permissions')
     metadata_errors, applications = [], []
     try:
         applications.extend(client.pages('/api/applications', 'applications'))
         apps = ApplicationIndex(applications)
     except (ExportError, *RECOVERABLE) as exc:
+        if args.application:
+            raise ExportError('Cannot filter by --application: application list unavailable '
+                              f'({safe_error(exc)})') from None
         # Project export continues; mappings are then flagged partial_or_unknown.
         metadata_errors.append({'stage': 'applications', 'error': safe_error(exc)})
         apps = ApplicationIndex([a for a in applications if 'id' in a], complete=False)
+    selected = project_filter(args, apps)
+    projects = [x for x in client.pages('/api/projects', 'projects') if selected(x)]
+    if not projects:
+        raise ExportError('No visible projects matched; check filters and account permissions')
     (out / 'raw' / 'applications.json').write_text(encoded(applications), encoding='utf-8')
     (out / 'raw' / 'projects.json').write_text(encoded(projects), encoding='utf-8')
     write_csv(out / 'applications.csv', (dict(application_id=a['id'], application=a.get('name', ''),
@@ -659,6 +694,8 @@ def main(argv=None):
     summary = {'generated_at': exporter.now.isoformat(), 'visible_projects_in_scope': len(projects),
                'packages': csvs['packages'].count, 'finding_rows': csvs['findings'].count,
                'filters': {'ecosystems': args.ecosystems, 'package': args.package, 'cve': args.cve},
+               'project_filters': {'project': args.project, 'tag': args.tag, 'application': args.application,
+                                   'group': args.group, 'branch': args.branch},
                'scope': 'All retained scans; completed SCA reports' if args.dump_all else 'Latest confirmed completed SCA scan per observed branch',
                'metadata_errors': metadata_errors, 'visible_applications': len(applications),
                'scan_records': csvs['scans'].count,

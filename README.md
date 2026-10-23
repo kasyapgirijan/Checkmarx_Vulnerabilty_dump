@@ -12,7 +12,8 @@ This includes all visible projects and applications, all retained scan metadata,
 and both CycloneDX and original SCA JSON reports for every scan with a confirmed
 completed SCA engine. All package ecosystems, severities and dependency scopes are
 included. Failed/incomplete/non-SCA scans remain in scans.csv and coverage.csv;
-they cannot supply completed SCA reports. Filters cannot be used with --dump-all.
+they cannot supply completed SCA reports. Project selection filters (--project, --tag,
+--application, --group) can be combined with --dump-all; --branch and finding filters cannot.
 
 This is a full **SCA exposure dump plus application/project/scan metadata**, not a
 backup of source code or SAST/DAST/container finding details. Deleted or expired
@@ -221,6 +222,25 @@ Search vulnerable instances of a package:
 ```powershell
 python checkmarx_exposure.py --package django --ecosystems pypi --out django-review
 ```
+
+Select projects by tag, application or group:
+
+```powershell
+# Projects tagged team=payments (exact key=value) or having a "pci" tag (any value)
+python checkmarx_exposure.py --tag team=payments --tag pci --out tagged
+# Projects in the "Mobile Banking" application (name or ID), npm findings only
+python checkmarx_exposure.py --application "Mobile Banking" --ecosystems npm --out mobile-npm
+# Full history for one group
+python checkmarx_exposure.py --dump-all --group "GROUP_FROM_PROJECTS_CSV" --out group-dump
+```
+
+Matching is case-insensitive. Repeating the same option means *any of* (OR); different
+options must all match (AND), together with --project. `--application` matches the
+exact application name or ID; it stops with an error if applications cannot be read,
+rather than silently exporting the wrong set. `--group` matches the values in the
+project's `groups` field as returned by the API (often group IDs); see the
+`groups_json` column of projects.csv from an earlier run for the exact values. Filtering
+is done locally after listing all visible projects, so it uses exactly these rules.
 
 Restrict to a known release branch if appropriate:
 
