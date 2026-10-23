@@ -18,7 +18,10 @@ This is a full **SCA exposure dump plus application/project/scan metadata**, not
 backup of source code or SAST/DAST/container finding details. Deleted or expired
 records and data outside the API identity's permissions are unavailable.
 Historical scans can make this substantially slower than the default latest-scan
-mode and create repeated package/finding rows across scan IDs. No resume mode is
+mode and create repeated package/finding rows across scan IDs. In coverage.csv,
+`scan_role` is `current` for each branch's newest completed SCA scan and
+`historical` for older scans; historical rows only affect the exit code when their
+export fails, so a full dump is not flagged merely because old scans are stale. No resume mode is
 implemented; retain completed raw files if a run is interrupted.
 
 New exports:
@@ -33,6 +36,9 @@ New exports:
 | raw/projects.json | Original project list records |
 | raw/scans-PROJECT_ID.jsonl | Original scan records, saved as retrieved |
 
+Every scans, packages, findings, matches, coverage and projects row carries the
+project name (`project`) and its application names (`applications`, plain text
+separated by `; `, empty when unassigned) for easy filtering in Excel/Power BI.
 Application IDs/names/tags and project/scan tags also accompany package and finding
 rows. Tags stay as JSON to preserve keys, empty values and differing tags at each
 level. Application name/tag objects are keyed by application ID; memberships do
@@ -216,7 +222,7 @@ that a Checkmarx project or application necessarily equals a commercial product.
 | packages.csv | Full package inventory; use this to find usage even without a reported CVE |
 | findings.csv | All exported vulnerability/component associations; includes triage state |
 | matches.csv | Finding rows matching --ecosystems, --package and --cve (AND logic) |
-| coverage.csv | One record per project/branch, plus project-level retrieval errors |
+| coverage.csv | One record per project/branch (per scan with --dump-all), plus project-level retrieval errors |
 | raw/*.cdx.json | Original CycloneDX evidence for each selected scan |
 | raw/*.scan-report.json | Optional original Checkmarx scan report |
 | run.json | Run timestamp, scope, filters and limitations |
@@ -250,16 +256,21 @@ API visibility limits mean undisclosed/inaccessible projects cannot be enumerate
 
 CSV cells beginning with spreadsheet formula characters receive a leading apostrophe.
 Raw JSON retains the original values. Treat outputs as internal security information.
-Downloads intentionally do not forward API tokens to signed download URLs. An
-unexpected redirect/download format fails visibly rather than silently authenticating
-to another host. If your tenant returns a different export format, retain the raw
+Reports are downloaded from the documented, authenticated
+`/api/sca/export/requests/{exportId}/download` endpoint on your configured
+`base_url` (as ast-cli does); the `fileUrl` returned by the status endpoint is not
+followed. If the download redirects to another host (for example signed storage),
+that request is sent without API credentials. Report files are saved byte-for-byte
+as downloaded. If your tenant returns a different export format, retain the raw
 report and adapt the parser against a sanitized sample.
 
 ## Validation and sources
 
 Validated locally with mocked API responses and synthetic CycloneDX fixtures:
 pagination, failed-SCA fallback per branch, scoped package/CVE matching, unresolved
-references, missing vulnerability data, report polling and separated download auth.
+references, missing vulnerability data, report polling (including transient 400/404
+responses while an export is being prepared), authenticated download, off-host
+redirects without credentials and UTF-8 BOM handling.
 No live tenant credentials were used, so live integration remains to be validated.
 
 Run tests: `python -m unittest -v test_checkmarx_exposure.py`.

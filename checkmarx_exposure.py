@@ -3,22 +3,41 @@
 import argparse
 import base64
 import configparser
+import contextlib
 import csv
 import json
 import os
-from pathlib import Path
 import sys
 import time
 from datetime import datetime, timezone
-from urllib.parse import quote, urlsplit
+from pathlib import Path
+from urllib.parse import quote, urljoin, urlsplit
 
 import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
+DEFAULT_CONFIG = Path(__file__).resolve().with_name('config.ini')
+CONNECT_TIMEOUT, READ_TIMEOUT = 15, 120
+PAGE_SIZE = 100
+POLL_INTERVAL = 5  # Seconds; matches Checkmarx ast-cli export polling.
+EXPORT_ENDPOINT = '/api/sca/export/requests'
+REDIRECTS = (301, 302, 303, 307, 308)
+SEVERITY_RANK = {'critical': 5, 'high': 4, 'medium': 3, 'low': 2, 'info': 1, 'none': 0}
+ECOSYSTEM_ALIASES = {'node': 'npm', 'nodejs': 'npm', 'python': 'pypi'}
+# Expected, recoverable failures for a single project/scan; anything else is a bug.
+RECOVERABLE = (requests.RequestException, KeyError, ValueError, TypeError)
+ENV_KEYS = {'base_url': 'CX_BASE_URL', 'token_url': 'CX_TOKEN_URL', 'api_key': 'CX_API_KEY',
+            'client_id': 'CX_CLIENT_ID', 'client_secret': 'CX_CLIENT_SECRET'}
+
 
 class ExportError(Exception):
     pass
+
+
+def safe_error(exc):
+    # requests exception text can contain signed URLs or tokens; never log/CSV it.
+    return str(exc) if isinstance(exc, ExportError) else type(exc).__name__
 
 
 def https_url(value):
@@ -30,23 +49,25 @@ def https_url(value):
 
 def session():
     s = requests.Session()
-    # POSTs are deliberately not retried: they can create duplicate export jobs.
+    # POSTs are deliberately not retried here: they can create duplicate export jobs.
     s.mount('https://', HTTPAdapter(max_retries=Retry(
         total=4, backoff_factor=1, status_forcelist=[429, 502, 503, 504],
         allowed_methods=['GET'], respect_retry_after_header=True)))
     return s
 
 
-def checked_json(response, label):
-    if not 200 <= response.status_code < 300:
-        raise ExportError(f'{label}: HTTP {response.status_code}')
+def decode_json(content, label):
+    # Checkmarx export files may start with a UTF-8 BOM (ast-cli strips it too).
     try:
-        return response.json()
-    except ValueError:
+        return json.loads(content.decode('utf-8-sig') if isinstance(content, bytes) else content)
+    except (ValueError, UnicodeError):
         raise ExportError(f'{label}: invalid JSON') from None
 
 
-DEFAULT_CONFIG = Path(__file__).resolve().with_name('config.ini')
+def checked_json(response, label):
+    if not 200 <= response.status_code < 300:
+        raise ExportError(f'{label}: HTTP {response.status_code}')
+    return decode_json(response.content, label)
 
 
 def load_settings(config_path=None):
@@ -66,18 +87,25 @@ def load_settings(config_path=None):
             raise ExportError('Cannot read config: check file permissions and INI syntax') from None
     elif config_path is not None:
         raise ExportError('Specified config file does not exist')
-    keys = {'base_url': 'CX_BASE_URL', 'token_url': 'CX_TOKEN_URL',
-            'api_key': 'CX_API_KEY', 'client_id': 'CX_CLIENT_ID',
-            'client_secret': 'CX_CLIENT_SECRET'}
-    result = {key: (os.getenv(env) or values.get(key, '')).strip() for key, env in keys.items()}
+    result = {key: (os.getenv(env) or values.get(key, '')).strip() for key, env in ENV_KEYS.items()}
     for key in ('base_url', 'token_url'):
         if not result[key]:
-            raise ExportError('Missing ' + key + ': set it in config.ini or ' + keys[key])
+            raise ExportError(f'Missing {key}: set it in config.ini or {ENV_KEYS[key]}')
     if not result['api_key'] and not (result['client_id'] and result['client_secret']):
         raise ExportError('Set api_key in config.ini (or CX_API_KEY), or provide client_id and client_secret')
     if result['api_key'].startswith('YOUR_'):
         raise ExportError('Replace the api_key placeholder in your local config.ini')
     return result
+
+
+def token_client_id(api_key):
+    """ast-cli uses the API key's azp claim as client_id, falling back to ast-app."""
+    try:
+        payload = api_key.split('.')[1]
+        claims = json.loads(base64.urlsafe_b64decode(payload + '=' * (-len(payload) % 4)))
+        return claims.get('azp') or 'ast-app'
+    except (ValueError, IndexError, TypeError, AttributeError):
+        return 'ast-app'
 
 
 class Client:
@@ -95,75 +123,109 @@ class Client:
 
     def authenticate(self):
         if self.api_key:
-            client_id = self.client_id or 'ast-app'
-            if not self.client_id:
-                try:
-                    payload = self.api_key.split('.')[1]
-                    client_id = json.loads(base64.urlsafe_b64decode(payload + '=' * (-len(payload) % 4))).get('azp') or client_id
-                except (ValueError, IndexError, TypeError):
-                    pass
-            data = dict(grant_type='refresh_token', client_id=client_id, refresh_token=self.api_key)
+            # The API key is a long-lived offline refresh token; it is reused for every
+            # renewal, as ast-cli does, rather than replaced by a session-bound token.
+            data = dict(grant_type='refresh_token', refresh_token=self.api_key,
+                        client_id=self.client_id or token_client_id(self.api_key))
         else:
             data = dict(grant_type='client_credentials', client_id=self.client_id, client_secret=self.secret)
-        result = checked_json(self.http.post(self.token_url, data=data, timeout=(15, 90), allow_redirects=False), 'Authentication')
+        response = self.http.post(self.token_url, data=data, allow_redirects=False,
+                                  timeout=(CONNECT_TIMEOUT, READ_TIMEOUT))
+        result = checked_json(response, 'Authentication')
+        if not result.get('access_token'):
+            raise ExportError('Authentication: no access token returned')
         self.token = result['access_token']
         self.expires = time.monotonic() + max(1, float(result.get('expires_in', 300)) - 30)
-        if self.api_key and result.get('refresh_token'):
-            self.api_key = result['refresh_token']
 
-    def api(self, method, path, **kwargs):
+    def send(self, method, path, **kwargs):
+        """Authenticated request to the configured Checkmarx origin; returns the raw response."""
         for attempt in range(2):
             if time.monotonic() >= self.expires:
                 self.authenticate()
-            response = self.http.request(method, self.base + path,
-                headers={'Authorization': 'Bearer ' + self.token}, timeout=(15, 90),
-                allow_redirects=False, **kwargs)
-            if response.status_code == 401 and attempt == 0:
-                self.expires = 0
-                continue
-            return checked_json(response, path)
-        raise ExportError('Authentication failed')
+            response = self.http.request(method, self.base + path, allow_redirects=False,
+                                         headers={'Authorization': 'Bearer ' + self.token},
+                                         timeout=(CONNECT_TIMEOUT, READ_TIMEOUT), **kwargs)
+            if response.status_code != 401 or attempt:
+                return response
+            self.expires = 0  # Token revoked or expired early: renew once and retry.
+        raise AssertionError('unreachable')
+
+    def api(self, method, path, **kwargs):
+        return checked_json(self.send(method, path, **kwargs), path)
 
     def pages(self, path, key, **params):
         offset, seen = 0, set()
         while True:
-            result = self.api('GET', path, params={**params, 'limit': 100, 'offset': offset})
+            result = self.api('GET', path, params={**params, 'limit': PAGE_SIZE, 'offset': offset})
             batch = result.get(key)
             if not isinstance(batch, list):
                 raise ExportError(f'{path}: missing {key} array')
             if not batch:
-                break
-            for item in batch:
-                ident = item['id']
-                if ident in seen:
-                    raise ExportError(f'{path}: repeated ID during pagination; rerun when scans are stable')
-                seen.add(ident)
+                return
+            fresh = [item for item in batch if item['id'] not in seen]
+            if not fresh:
+                # Server ignored the offset; stop instead of looping forever.
+                raise ExportError(f'{path}: pagination returned only repeated IDs')
+            # Records created during paging shift later pages; skip the repeats.
+            for item in fresh:
+                seen.add(item['id'])
                 yield item
             offset += len(batch)
-            # Request until empty, allowing server-side page-size caps.
+            total = result.get('filteredTotalCount', result.get('totalCount'))
+            if isinstance(total, int) and offset >= total:
+                return
 
     def export(self, scan_id, fmt, timeout):
-        endpoint = '/api/sca/export/requests'
-        job = self.api('POST', endpoint, json={
-            'ScanId': scan_id, 'FileFormat': fmt,
-            'ExportParameters': {'hideDevAndTestDependencies': False,
-                                 'excludeVulnerabilities': False}})
-        export_id = job['exportId']
+        """Generate an SCA export and return the original file bytes."""
         deadline = time.monotonic() + timeout
-        while time.monotonic() < deadline:
-            result = self.api('GET', endpoint, params={'exportId': export_id, 'returnUrl': 'true'})
-            state = str(result.get('exportStatus', '')).lower()
-            if state == 'completed':
-                url = https_url(result['fileUrl'])
-                # Signed URL has its own authorization. No API credentials are sent.
-                response = self.download.get(url, timeout=(15, 120), allow_redirects=False)
-                return checked_json(response, 'Report download')
-            if state == 'failed':
-                raise ExportError('Report generation failed')
-            if state not in ('pending', 'exporting'):
-                raise ExportError('Unexpected export status')
-            time.sleep(3)
-        raise ExportError('Report generation timed out')
+        export_id = self._request_export(scan_id, fmt, deadline)
+        while True:
+            response = self.send('GET', EXPORT_ENDPOINT, params={'exportId': export_id})
+            # A freshly created export can briefly be unknown (404) to the status endpoint.
+            if response.status_code != 404:
+                result = checked_json(response, 'Export status')
+                state = str(result.get('exportStatus', '')).lower()
+                if state == 'completed':
+                    return self._download(export_id)
+                if state == 'failed':
+                    detail = str(result.get('errorMessage') or '')[:200]
+                    raise ExportError('Report generation failed' + (': ' + detail if detail else ''))
+                if state not in ('pending', 'exporting'):
+                    raise ExportError('Unexpected export status')
+            if time.monotonic() >= deadline:
+                raise ExportError('Report generation timed out')
+            time.sleep(POLL_INTERVAL)
+
+    def _request_export(self, scan_id, fmt, deadline):
+        payload = {'ScanID': scan_id, 'FileFormat': fmt, 'ExportParameters': {
+            'hideDevAndTestDependencies': False, 'showOnlyEffectiveLicenses': False,
+            'excludePackages': False, 'excludeLicenses': False,
+            'excludeVulnerabilities': False, 'excludePolicies': False}}
+        while True:
+            response = self.send('POST', EXPORT_ENDPOINT, json=payload)
+            # 400 is returned while SCA results are not yet exportable; no job is created,
+            # so retrying cannot duplicate work (ast-cli does the same).
+            if response.status_code != 400 or time.monotonic() >= deadline:
+                job = checked_json(response, 'Export request')
+                if not job.get('exportId'):
+                    raise ExportError('Export request: no exportId returned')
+                return job['exportId']
+            time.sleep(POLL_INTERVAL)
+
+    def _download(self, export_id):
+        path = f'{EXPORT_ENDPOINT}/{quote(str(export_id), safe="")}/download'
+        response = self.send('GET', path)
+        if response.status_code in REDIRECTS:
+            location = urljoin(self.base + path, response.headers.get('Location', ''))
+            if location.startswith(self.base + '/'):
+                response = self.send('GET', location[len(self.base):])
+            else:
+                # Other hosts (e.g. signed storage URLs) never receive API credentials.
+                response = self.download.get(https_url(location), allow_redirects=False,
+                                             timeout=(CONNECT_TIMEOUT, READ_TIMEOUT))
+        if response.status_code != 200:
+            raise ExportError(f'Report download: HTTP {response.status_code}')
+        return response.content
 
 
 def field(obj, name, default=''):
@@ -173,7 +235,7 @@ def field(obj, name, default=''):
 def sca_completed(scan):
     return any(str(field(d, 'name')).lower() == 'sca' and
                str(field(d, 'status')).lower() == 'completed'
-               for d in scan.get('statusDetails', []))
+               for d in scan.get('statusDetails') or [])
 
 
 def parse_date(value):
@@ -184,24 +246,37 @@ def parse_date(value):
         return datetime.min.replace(tzinfo=timezone.utc)
 
 
+def branch_of(scan):
+    return scan.get('branch') or '(unknown)'
+
+
+def newest_first(scans):
+    return sorted(scans, key=lambda s: parse_date(s.get('createdAt')), reverse=True)
+
+
 def choose_scans(scans, branch=None):
+    """Per branch: (branch, newest scan, newest scan with completed SCA or None)."""
     groups = {}
     for scan in scans:
-        name = scan.get('branch') or '(unknown)'
-        if branch is None or name == branch:
-            groups.setdefault(name, []).append(scan)
+        if branch is None or branch_of(scan) == branch:
+            groups.setdefault(branch_of(scan), []).append(scan)
     chosen = []
     for name, items in sorted(groups.items()):
-        items.sort(key=lambda s: parse_date(s.get('createdAt')), reverse=True)
-        selected = next((s for s in items if sca_completed(s)), None)
-        chosen.append((name, items[0], selected))
+        items = newest_first(items)
+        chosen.append((name, items[0], next((s for s in items if sca_completed(s)), None)))
     return chosen
+
+
+def all_scan_selections(scans):
+    """Every scan, newest first, with its branch's newest scan for comparison."""
+    latest = {name: newest for name, newest, _ in choose_scans(scans)}
+    return [(branch_of(s), latest[branch_of(s)], s) for s in newest_first(scans)]
 
 
 def components(items):
     for c in items:
         yield c
-        yield from components(c.get('components', []))
+        yield from components(c.get('components') or [])
 
 
 def flatten(bom, context):
@@ -210,12 +285,12 @@ def flatten(bom, context):
     packages, findings, by_ref = [], [], {}
     for c in components(bom['components']):
         purl = c.get('purl', '')
-        ecosystem = purl[4:].split('/', 1)[0] if purl.startswith('pkg:') else 'unknown'
-        name = '/'.join(filter(None, [c.get('group'), c.get('name')]))
         ref = c.get('bom-ref', '')
-        row = {**context, 'component_ref': ref, 'package': name, 'version': c.get('version', ''),
-               'ecosystem': ecosystem, 'purl': purl, 'scope': c.get('scope', ''),
-               'component_type': c.get('type', ''), 'runtime_verified': 'not_assessed'}
+        row = {**context, 'component_ref': ref, 'version': c.get('version', ''),
+               'package': '/'.join(filter(None, [c.get('group'), c.get('name')])),
+               'ecosystem': purl[4:].split('/', 1)[0] if purl.startswith('pkg:') else 'unknown',
+               'purl': purl, 'scope': c.get('scope', ''), 'component_type': c.get('type', ''),
+               'runtime_verified': 'not_assessed'}
         packages.append(row)
         if ref:
             by_ref[ref] = row
@@ -224,11 +299,15 @@ def flatten(bom, context):
         raise ExportError('Unexpected vulnerabilities schema')
     unresolved = 0
     for v in vulnerabilities:
-        ratings = v.get('ratings', [])
-        ranks = {'critical': 5, 'high': 4, 'medium': 3, 'low': 2, 'info': 1, 'none': 0}
-        severity = max((r.get('severity', 'unknown').lower() for r in ratings),
-                       key=lambda s: ranks.get(s, -1), default='unknown')
-        aliases = [r.get('id', '') for r in v.get('references', [])]
+        ratings = v.get('ratings') or []
+        severity = max((str(r.get('severity') or 'unknown').lower() for r in ratings),
+                       key=lambda s: SEVERITY_RANK.get(s, -1), default='unknown')
+        details = {'vulnerability': v.get('id', ''),
+                   'aliases': ';'.join(r.get('id', '') for r in v.get('references') or []),
+                   'severity': severity, 'ratings_json': json.dumps(ratings, ensure_ascii=False),
+                   'analysis_state': (v.get('analysis') or {}).get('state', ''),
+                   'recommendation': v.get('recommendation', ''),
+                   'source_url': (v.get('source') or {}).get('url', '')}
         for affected in v.get('affects') or [{'ref': ''}]:
             ref = affected.get('ref', '')
             package = by_ref.get(ref)
@@ -236,72 +315,120 @@ def flatten(bom, context):
                 unresolved += 1
                 package = {**context, 'component_ref': ref, 'ecosystem': 'unknown',
                            'runtime_verified': 'not_assessed'}
-            findings.append({**package, 'vulnerability': v.get('id', ''),
-                'aliases': ';'.join(aliases), 'severity': severity,
-                'ratings_json': json.dumps(ratings, ensure_ascii=False),
-                'analysis_state': v.get('analysis', {}).get('state', ''),
-                'recommendation': v.get('recommendation', ''),
-                'affected_versions_json': json.dumps(affected.get('versions', [])),
-                'source_url': v.get('source', {}).get('url', ''),
-                'package_link_status': 'matched' if ref in by_ref else 'unresolved'})
+            findings.append({**package, **details,
+                             'affected_versions_json': json.dumps(affected.get('versions', [])),
+                             'package_link_status': 'matched' if ref in by_ref else 'unresolved'})
     status = 'present' if 'vulnerabilities' in bom else 'not_provided'
     return packages, findings, status, unresolved
 
 
 META = ['application_ids_json', 'application_names_json', 'application_tags_json', 'application_mapping_status', 'project_tags_json', 'scan_tags_json']
-BASE = META + ['product', 'product_mapping', 'project', 'project_id', 'branch', 'scan_id', 'scan_date', 'scan_age_days']
+BASE = META + ['product', 'product_mapping', 'project', 'applications', 'project_id', 'branch', 'scan_id', 'scan_date', 'scan_age_days']
 PKG = BASE + ['component_ref', 'package', 'version', 'ecosystem', 'purl', 'scope', 'component_type', 'runtime_verified']
 FIND = PKG + ['vulnerability', 'aliases', 'severity', 'ratings_json', 'analysis_state', 'recommendation', 'affected_versions_json', 'source_url', 'package_link_status']
-COVER = BASE + ['status', 'latest_scan_id', 'latest_scan_status', 'newer_scan_than_selected', 'vulnerability_section', 'package_count', 'finding_count', 'unresolved_links', 'runtime_verified', 'error']
+COVER = BASE + ['scan_role', 'status', 'latest_scan_id', 'latest_scan_status', 'newer_scan_than_selected', 'vulnerability_section', 'package_count', 'finding_count', 'unresolved_links', 'runtime_verified', 'error']
+PROJECT_FIELDS = ['project_id', 'project', 'applications', 'product', 'product_mapping', 'main_branch', 'repo_url'] + META
+LINK_FIELDS = ['application_id', 'application', 'project_id', 'project', 'application_tags_json', 'project_tags_json']
+SCAN_FIELDS = BASE + ['status', 'status_details_json', 'engines_json']
+APP_FIELDS = ['application_id', 'application', 'tags_json', 'project_ids_json', 'description', 'criticality']
+
+
+def spreadsheet_safe(value):
+    # Prevent spreadsheet formula execution when imported into Excel.
+    if isinstance(value, str) and value.lstrip().startswith(('=', '+', '-', '@', '\t', '\r')):
+        return "'" + value
+    return value
+
+
+class CsvWriter:
+    """Streams rows to disk so large tenants are not held in memory."""
+
+    def __init__(self, path, fields):
+        self.file = path.open('w', encoding='utf-8-sig', newline='')
+        self.writer = csv.DictWriter(self.file, fieldnames=fields, extrasaction='ignore')
+        self.writer.writeheader()
+        self.count = 0
+
+    def write(self, rows):
+        for row in rows:
+            self.writer.writerow({k: spreadsheet_safe(v) for k, v in row.items()})
+            self.count += 1
+
+    def close(self):
+        self.file.close()
 
 
 def write_csv(path, rows, fields):
-    def safe(value):
-        # Prevent spreadsheet formula execution when imported into Excel.
-        if isinstance(value, str) and value.lstrip().startswith(('=', '+', '-', '@', '\t', '\r')):
-            return "'" + value
-        return value
-    with path.open('w', encoding='utf-8-sig', newline='') as f:
-        writer = csv.DictWriter(f, fieldnames=fields, extrasaction='ignore')
-        writer.writeheader()
-        writer.writerows({k: safe(v) for k, v in row.items()} for row in rows)
+    writer = CsvWriter(path, fields)
+    try:
+        writer.write(rows)
+    finally:
+        writer.close()
 
 
-def matches(row, args):
-    ecosystems = {x.strip().lower() for x in args.ecosystems.split(',') if x.strip()}
-    ecosystems = {'npm' if x in ('node', 'nodejs') else 'pypi' if x == 'python' else x for x in ecosystems}
-    return ((not ecosystems or row.get('ecosystem') in ecosystems) and
-            (not args.package or args.package.lower() in row.get('package', '').lower()) and
-            (not args.cve or args.cve.lower() in [x.lower() for x in [row.get('vulnerability', '')] + row.get('aliases', '').split(';')]))
+def finding_filter(args):
+    """Build the matches.csv predicate once (ecosystem AND package AND CVE)."""
+    ecosystems = {x.strip().lower() for x in (args.ecosystems or '').split(',') if x.strip()}
+    ecosystems = {ECOSYSTEM_ALIASES.get(x, x) for x in ecosystems}
+    package = (args.package or '').lower()
+    cve = (args.cve or '').lower()
+
+    def matches(row):
+        ids = [row.get('vulnerability', '')] + row.get('aliases', '').split(';')
+        return ((not ecosystems or row.get('ecosystem') in ecosystems) and
+                (not package or package in row.get('package', '').lower()) and
+                (not cve or cve in (x.lower() for x in ids)))
+    return matches
 
 
 def encoded(value):
     return json.dumps(value, ensure_ascii=False, sort_keys=True)
 
 
-def application_context(project, applications, lookup_ok):
-    by_id = {a['id']: a for a in applications}
-    ids = set(project.get('applicationIds') or [])
-    ids.update(a['id'] for a in applications if project['id'] in (a.get('projectIds') or []))
-    ids = sorted(ids)
-    complete = lookup_ok and all(i in by_id for i in ids)
+class ApplicationIndex:
+    def __init__(self, applications, complete=True):
+        self.complete = complete
+        self.by_id = {a['id']: a for a in applications}
+        self.by_project = {}
+        for a in applications:
+            for pid in a.get('projectIds') or []:
+                self.by_project.setdefault(pid, set()).add(a['id'])
+        self.all_have_project_ids = all('projectIds' in a for a in applications)
+
+
+def application_context(project, index):
+    ids = sorted(set(project.get('applicationIds') or []) | index.by_project.get(project['id'], set()))
+    apps = {i: index.by_id[i] for i in ids if i in index.by_id}
+    complete = index.complete and len(apps) == len(ids)
     # Absence of association fields is a schema gap, not proof of no association.
-    schema_known = 'applicationIds' in project or (lookup_ok and all('projectIds' in a for a in applications))
+    schema_known = 'applicationIds' in project or (index.complete and index.all_have_project_ids)
     status = ('resolved' if ids else 'unassigned') if complete and schema_known else 'partial_or_unknown'
-    return {'application_ids_json': encoded(ids),
-            'application_names_json': encoded({i: by_id[i].get('name', '') for i in ids if i in by_id}),
-            'application_tags_json': encoded({i: by_id[i].get('tags') for i in ids if i in by_id}),
+    # Readable names for spreadsheets; the *_json columns stay authoritative (names can repeat).
+    names = sorted(str(a.get('name') or i) for i, a in apps.items())
+    return {'applications': '; '.join(names),
+            'application_ids_json': encoded(ids),
+            'application_names_json': encoded({i: a.get('name', '') for i, a in apps.items()}),
+            'application_tags_json': encoded({i: a.get('tags') for i, a in apps.items()}),
             'application_mapping_status': status,
             'project_tags_json': encoded(project.get('tags'))}
 
 
-def all_scan_selections(scans):
-    latest = {branch: newest for branch, newest, _ in choose_scans(scans)}
-    return [(s.get('branch') or '(unknown)', latest[s.get('branch') or '(unknown)'], s)
-            for s in sorted(scans, key=lambda x: parse_date(x.get('createdAt')), reverse=True)]
+def file_stem(identifier):
+    # Sanitize IDs for local filenames; the actual ID is preserved in CSV context.
+    return ''.join(ch if ch.isalnum() or ch in '-_' else '_' for ch in str(identifier))
 
 
-def main():
+def load_product_map(path):
+    if not path:
+        return {}
+    with path.open(encoding='utf-8-sig', newline='') as f:
+        reader = csv.DictReader(f)
+        if not {'project_id', 'product'} <= set(reader.fieldnames or []):
+            raise ExportError('Product map must have project_id and product columns')
+        return {r['project_id'].strip(): r['product'].strip() for r in reader if r['project_id']}
+
+
+def parse_args(argv=None):
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument('--out', default='checkmarx-output')
     p.add_argument('--config', type=Path, help='INI path; default config.ini beside this script, then environment fallback')
@@ -311,138 +438,171 @@ def main():
     p.add_argument('--package', help='Package name substring')
     p.add_argument('--cve', help='Exact vulnerability ID or alias')
     p.add_argument('--stale-days', type=int, default=30)
-    p.add_argument('--export-timeout', type=int, default=600)
+    p.add_argument('--export-timeout', type=int, default=600, help='Seconds allowed per report export')
     p.add_argument('--product-map', type=Path, help='CSV with project_id,product columns')
     p.add_argument('--raw-scan-report', action='store_true', help='Also download original ScanReportJson for review')
     p.add_argument('--dump-all', action='store_true', help='All visible projects, retained scans and completed SCA reports; no filters')
-    args = p.parse_args()
+    args = p.parse_args(argv)
     if args.dump_all:
         if any([args.project, args.branch, args.ecosystems, args.package, args.cve]):
             p.error('--dump-all cannot be combined with scope or finding filters')
         args.raw_scan_report = True
     if args.stale_days < 0 or args.export_timeout <= 0:
         p.error('stale-days must be >= 0 and export-timeout > 0')
+    return args
+
+
+class Exporter:
+    def __init__(self, client, args, out, csvs):
+        self.client, self.args, self.out, self.csv = client, args, out, csvs
+        self.raw = out / 'raw'
+        self.now = datetime.now(timezone.utc)
+        self.matches = finding_filter(args)
+        self.coverage, self.project_rows = [], []
+
+    def run_project(self, project, product_map, apps):
+        pid = project['id']
+        context = {'product': product_map.get(pid, project['name']),
+                   'product_mapping': 'explicit' if pid in product_map else 'project_name_fallback',
+                   'project': project['name'], 'project_id': pid, **application_context(project, apps)}
+        self.project_rows.append({**context, 'main_branch': project.get('mainBranch', ''),
+                                  'repo_url': project.get('repoUrl', '')})
+        self.csv['application_projects'].write(
+            {'project_id': pid, 'project': project['name'], 'application_id': aid,
+             'application': apps.by_id.get(aid, {}).get('name', ''),
+             'application_tags_json': encoded(apps.by_id.get(aid, {}).get('tags')),
+             'project_tags_json': context['project_tags_json']}
+            for aid in json.loads(context['application_ids_json']))
+        try:
+            scans = self.fetch_scans(pid, context)
+        except (ExportError, *RECOVERABLE) as exc:
+            self.coverage.append({**context, 'status': 'scan_list_error', 'error': safe_error(exc)})
+            return
+        current = {name: chosen['id'] for name, _, chosen in choose_scans(scans) if chosen}
+        selections = all_scan_selections(scans) if self.args.dump_all else choose_scans(scans, self.args.branch)
+        if not selections:
+            self.coverage.append({**context, 'branch': self.args.branch or '', 'status': 'no_scans_in_scope'})
+        for branch, latest, scan in selections:
+            role = 'current' if scan and current.get(branch) == scan['id'] else 'historical'
+            self.coverage.append(self.export_scan({**context, 'branch': branch, 'scan_role': role,
+                'latest_scan_id': latest['id'], 'latest_scan_status': latest.get('status', ''),
+                'runtime_verified': 'not_assessed'}, latest, scan))
+
+    def fetch_scans(self, pid, context):
+        scans = []
+        with (self.raw / f'scans-{quote(str(pid), safe="")}.jsonl').open('w', encoding='utf-8') as raw:
+            for record in self.client.pages('/api/scans', 'scans', **{'project-id': pid}):
+                scans.append(record)
+                raw.write(encoded(record) + '\n')
+                self.csv['scans'].write([{**context, 'scan_id': record['id'], 'branch': record.get('branch', ''),
+                    'scan_date': record.get('createdAt', ''), 'status': record.get('status', ''),
+                    'scan_tags_json': encoded(record.get('tags')),
+                    'status_details_json': encoded(record.get('statusDetails')),
+                    'engines_json': encoded(record.get('engines'))}])
+        return scans
+
+    def export_scan(self, c, latest, scan):
+        if not scan or not sca_completed(scan):
+            return {**c, 'scan_id': scan.get('id', '') if scan else '',
+                    'scan_date': scan.get('createdAt', '') if scan else '',
+                    'scan_tags_json': encoded(scan.get('tags')) if scan else '',
+                    'status': 'no_confirmed_completed_sca'}
+        age = (self.now - parse_date(scan.get('createdAt'))).total_seconds() / 86400
+        age_valid = bool(scan.get('createdAt')) and 0 <= age < 365000
+        c.update(scan_tags_json=encoded(scan.get('tags')), scan_id=scan['id'], scan_date=scan.get('createdAt', ''),
+                 scan_age_days=round(age, 1) if age_valid else '',
+                 newer_scan_than_selected=latest['id'] != scan['id'])
+        stem = file_stem(scan['id'])
+        errors = []
+        try:
+            content = self.client.export(scan['id'], 'CycloneDxJson', self.args.export_timeout)
+            (self.raw / f'{stem}.cdx.json').write_bytes(content)  # Original evidence, unmodified.
+            pkgs, vulns, section, unresolved = flatten(decode_json(content, 'CycloneDX'),
+                                                       {k: c.get(k, '') for k in BASE})
+            self.csv['packages'].write(pkgs)
+            self.csv['findings'].write(vulns)
+            self.csv['matches'].write(r for r in vulns if self.matches(r))
+            c.update(status='exported' if age_valid and age <= self.args.stale_days else 'stale_or_unknown_date',
+                     vulnerability_section=section, package_count=len(pkgs), finding_count=len(vulns),
+                     unresolved_links=unresolved)
+        except (ExportError, *RECOVERABLE) as exc:
+            errors.append('CycloneDxJson: ' + safe_error(exc))
+        if self.args.raw_scan_report:
+            try:
+                content = self.client.export(scan['id'], 'ScanReportJson', self.args.export_timeout)
+                (self.raw / f'{stem}.scan-report.json').write_bytes(content)
+            except (ExportError, *RECOVERABLE) as exc:
+                errors.append('ScanReportJson: ' + safe_error(exc))
+        if errors:
+            c.update(status='export_error', error='; '.join(errors))
+        return c
+
+
+def coverage_gap(row):
+    """Whether a coverage row should make the run exit 2 (needs review)."""
+    if row.get('status') == 'export_error' or row.get('status') == 'scan_list_error':
+        return True
+    if row.get('scan_role') == 'historical':
+        return False  # Older scans in --dump-all are evidence, not current exposure.
+    return (row.get('status') != 'exported' or row.get('vulnerability_section') != 'present'
+            or bool(row.get('unresolved_links')) or bool(row.get('newer_scan_than_selected')))
+
+
+def main(argv=None):
+    args = parse_args(argv)
     client = Client(args.config)
+    product_map = load_product_map(args.product_map)
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=False)  # Separate evidence per run; do not mix old/new exports.
     (out / 'raw').mkdir()
-    product_map = {}
-    if args.product_map:
-        with args.product_map.open(encoding='utf-8-sig', newline='') as f:
-            product_map = {r['project_id']: r['product'] for r in csv.DictReader(f)}
-    projects = list(client.pages('/api/projects', 'projects'))
-    projects = [x for x in projects if not args.project or args.project.lower() in x['name'].lower()]
+    projects = [x for x in client.pages('/api/projects', 'projects')
+                if not args.project or args.project.lower() in x['name'].lower()]
     if not projects:
         raise ExportError('No visible projects matched; check filter and account permissions')
-    metadata_errors = []
-    applications = []
-    apps_ok = True
+    metadata_errors, applications = [], []
     try:
-        for application in client.pages('/api/applications', 'applications'):
-            applications.append(application)
-    except (ExportError, requests.RequestException, KeyError, ValueError) as exc:
-        apps_ok = False
+        applications.extend(client.pages('/api/applications', 'applications'))
+        apps = ApplicationIndex(applications)
+    except (ExportError, *RECOVERABLE) as exc:
+        # Project export continues; mappings are then flagged partial_or_unknown.
         metadata_errors.append({'stage': 'applications', 'error': safe_error(exc)})
+        apps = ApplicationIndex([a for a in applications if 'id' in a], complete=False)
     (out / 'raw' / 'applications.json').write_text(encoded(applications), encoding='utf-8')
     (out / 'raw' / 'projects.json').write_text(encoded(projects), encoding='utf-8')
-    write_csv(out / 'applications.csv', [dict(application_id=a['id'], application=a.get('name', ''),
+    write_csv(out / 'applications.csv', (dict(application_id=a['id'], application=a.get('name', ''),
         tags_json=encoded(a.get('tags')), project_ids_json=encoded(a.get('projectIds')),
-        description=a.get('description', ''), criticality=a.get('criticality', '')) for a in applications],
-        ['application_id', 'application', 'tags_json', 'project_ids_json', 'description', 'criticality'])
-    project_rows, links, scan_rows = [], [], []
-    packages, findings, coverage = [], [], []
-    now = datetime.now(timezone.utc)
-    for index, project in enumerate(projects, 1):
-        pid = project['id']
-        print(f'Project {index}/{len(projects)}: {project["name"]}', flush=True)
-        context = {'product': product_map.get(pid, project['name']),
-                   'product_mapping': 'explicit' if pid in product_map else 'project_name_fallback',
-                   'project': project['name'], 'project_id': pid,
-                   **application_context(project, applications, apps_ok)}
-        project_rows.append({**context, 'main_branch': project.get('mainBranch', ''), 'repo_url': project.get('repoUrl', '')})
-        for aid in json.loads(context['application_ids_json']):
-            app = next((a for a in applications if a['id'] == aid), {})
-            links.append({'project_id': pid, 'project': project['name'], 'application_id': aid,
-                          'application': app.get('name', ''), 'application_tags_json': encoded(app.get('tags')),
-                          'project_tags_json': context['project_tags_json']})
-        try:
-            scans = []
-            scan_path = out / 'raw' / ('scans-' + quote(str(pid), safe='') + '.jsonl')
-            with scan_path.open('w', encoding='utf-8') as scan_file:
-                for record in client.pages('/api/scans', 'scans', **{'project-id': pid}):
-                    scans.append(record)
-                    scan_file.write(encoded(record) + '\n')
-                    scan_rows.append({**context, 'scan_id': record['id'], 'branch': record.get('branch', ''),
-                        'scan_date': record.get('createdAt', ''), 'status': record.get('status', ''),
-                        'scan_tags_json': encoded(record.get('tags')),
-                        'status_details_json': encoded(record.get('statusDetails')),
-                        'engines_json': encoded(record.get('engines'))})
-            selections = all_scan_selections(scans) if args.dump_all else choose_scans(scans, args.branch)
-        except (ExportError, requests.RequestException, KeyError, ValueError) as exc:
-            coverage.append({**context, 'status': 'scan_list_error', 'error': safe_error(exc)})
-            continue
-        if not selections:
-            coverage.append({**context, 'branch': args.branch or '', 'status': 'no_scans_in_scope'})
-        for branch, latest, scan in selections:
-            c = {**context, 'branch': branch, 'latest_scan_id': latest['id'],
-                 'latest_scan_status': latest.get('status', ''), 'runtime_verified': 'not_assessed'}
-            if not scan or not sca_completed(scan):
-                coverage.append({**c, 'scan_id': scan.get('id', '') if scan else '',
-                                 'scan_date': scan.get('createdAt', '') if scan else '',
-                                 'scan_tags_json': encoded(scan.get('tags')) if scan else '',
-                                 'status': 'no_confirmed_completed_sca'})
-                continue
-            age = (now - parse_date(scan.get('createdAt'))).total_seconds() / 86400
-            age_valid = scan.get('createdAt') and 0 <= age < 365000
-            c.update(scan_tags_json=encoded(scan.get('tags')), scan_id=scan['id'], scan_date=scan.get('createdAt', ''),
-                     scan_age_days=round(age, 1) if age_valid else '',
-                     newer_scan_than_selected=latest['id'] != scan['id'])
-            try:
-                bom = client.export(scan['id'], 'CycloneDxJson', args.export_timeout)
-                # Sanitize IDs for local filenames; actual ID is preserved in context.
-                stem = ''.join(ch if ch.isalnum() or ch in '-_' else '_' for ch in str(scan['id']))
-                (out / 'raw' / (stem + '.cdx.json')).write_text(json.dumps(bom, indent=2), encoding='utf-8')
-                pkgs, vulns, section, unresolved = flatten(bom, {k: c.get(k, '') for k in BASE})
-                packages.extend(pkgs)
-                findings.extend(vulns)
-                c.update(status='exported' if age_valid and age <= args.stale_days else 'stale_or_unknown_date',
-                         vulnerability_section=section, package_count=len(pkgs), finding_count=len(vulns), unresolved_links=unresolved)
-            except (ExportError, requests.RequestException, KeyError, ValueError, TypeError) as exc:
-                c.update(status='export_error', error=safe_error(exc))
-            if args.raw_scan_report:
-                try:
-                    stem = ''.join(ch if ch.isalnum() or ch in '-_' else '_' for ch in str(scan['id']))
-                    report = client.export(scan['id'], 'ScanReportJson', args.export_timeout)
-                    (out / 'raw' / (stem + '.scan-report.json')).write_text(json.dumps(report, indent=2), encoding='utf-8')
-                except (ExportError, requests.RequestException, KeyError, ValueError, TypeError) as exc:
-                    c.update(status='export_error', error=c.get('error', '') + ' ScanReportJson: ' + safe_error(exc))
-            coverage.append(c)
-    write_csv(out / 'projects.csv', project_rows, ['project_id', 'project', 'product', 'product_mapping', 'main_branch', 'repo_url'] + META)
-    write_csv(out / 'application_projects.csv', links, ['application_id', 'application', 'project_id', 'project', 'application_tags_json', 'project_tags_json'])
-    write_csv(out / 'scans.csv', scan_rows, BASE + ['status', 'status_details_json', 'engines_json'])
-    write_csv(out / 'packages.csv', packages, PKG)
-    write_csv(out / 'findings.csv', findings, FIND)
-    write_csv(out / 'matches.csv', [r for r in findings if matches(r, args)], FIND)
-    write_csv(out / 'coverage.csv', coverage, COVER)
-    summary = {'generated_at': now.isoformat(), 'visible_projects_in_scope': len(projects),
-               'packages': len(packages), 'finding_rows': len(findings),
+        description=a.get('description', ''), criticality=a.get('criticality', ''))
+        for a in apps.by_id.values()), APP_FIELDS)
+
+    with contextlib.ExitStack() as stack:
+        csvs = {}
+        for name, fields in [('application_projects', LINK_FIELDS), ('scans', SCAN_FIELDS),
+                             ('packages', PKG), ('findings', FIND), ('matches', FIND)]:
+            csvs[name] = CsvWriter(out / f'{name}.csv', fields)
+            stack.callback(csvs[name].close)
+        exporter = Exporter(client, args, out, csvs)
+        for index, project in enumerate(projects, 1):
+            print(f'Project {index}/{len(projects)}: {project["name"]}', flush=True)
+            exporter.run_project(project, product_map, apps)
+    write_csv(out / 'projects.csv', exporter.project_rows, PROJECT_FIELDS)
+    write_csv(out / 'coverage.csv', exporter.coverage, COVER)
+
+    summary = {'generated_at': exporter.now.isoformat(), 'visible_projects_in_scope': len(projects),
+               'packages': csvs['packages'].count, 'finding_rows': csvs['findings'].count,
                'filters': {'ecosystems': args.ecosystems, 'package': args.package, 'cve': args.cve},
                'scope': 'All retained scans; completed SCA reports' if args.dump_all else 'Latest confirmed completed SCA scan per observed branch',
-               'metadata_errors': metadata_errors, 'visible_applications': len(applications), 'scan_records': len(scan_rows),
+               'metadata_errors': metadata_errors, 'visible_applications': len(applications),
+               'scan_records': csvs['scans'].count,
                'metadata_time_basis': 'Application associations and project/application tags are current at export, not historical',
                'runtime_assessment': 'Not performed; npm/pypi presence does not identify deployed runtimes',
                'limitations': ['Not a production deployment inventory', 'No new scans or vulnerability recalculation are triggered',
                                'No matches does not establish absence of exposure', 'Missing vulnerability section is unknown coverage']}
     (out / 'run.json').write_text(json.dumps(summary, indent=2), encoding='utf-8')
-    incomplete = bool(metadata_errors) or any(r['application_mapping_status'] == 'partial_or_unknown' for r in project_rows) or any(r.get('status') != 'exported' or r.get('vulnerability_section') != 'present'
-                     or r.get('unresolved_links', 0) or r.get('newer_scan_than_selected') for r in coverage)
-    print(f'Saved {len(packages)} packages, {len(findings)} finding rows. Review coverage.csv. Output: {out.resolve()}')
+    incomplete = (bool(metadata_errors) or any(coverage_gap(r) for r in exporter.coverage)
+                  or any(r['application_mapping_status'] == 'partial_or_unknown' for r in exporter.project_rows))
+    print(f'Saved {csvs["packages"].count} packages, {csvs["findings"].count} finding rows. '
+          f'Review coverage.csv. Output: {out.resolve()}')
     return 2 if incomplete else 0
-
-
-def safe_error(exc):
-    # requests exception text can contain a signed URL; never include it in logs/CSV.
-    return str(exc) if isinstance(exc, ExportError) else type(exc).__name__
 
 
 if __name__ == '__main__':
