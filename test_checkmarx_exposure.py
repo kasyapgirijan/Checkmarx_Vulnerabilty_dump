@@ -79,6 +79,7 @@ class Tests(unittest.TestCase):
     def export_client(self, responses):
         client = cx.Client.__new__(cx.Client)
         client.base = 'https://eu.ast.checkmarx.net'
+        client.verify = True
         client.send = Mock(side_effect=responses)
         client.download = Mock()
         return client
@@ -136,6 +137,7 @@ class Tests(unittest.TestCase):
     def test_dump_all_end_to_end(self, constructor):
         import csv
         client = constructor.return_value
+        client.verify = True
         scans = [{'id': 's1', 'branch': 'main', 'createdAt': '2026-10-01T00:00:00Z',
                   'statusDetails': [{'name': 'sca', 'status': 'Completed'}], 'tags': {'build': '1'}},
                  {'id': 's2', 'branch': 'main', 'createdAt': '2026-10-02T00:00:00Z',
@@ -207,6 +209,32 @@ class Tests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             with patch.object(cx, 'DEFAULT_CONFIG', Path(tmp) / 'missing.ini'):
                 self.assertEqual(cx.load_settings()['api_key'], 'test')
+
+    @patch.dict('os.environ', {'CX_BASE_URL': 'https://example.com', 'CX_TOKEN_URL': 'https://iam.example.com/token',
+        'CX_API_KEY': 'test', 'REQUESTS_CA_BUNDLE': '/etc/ssl/certs/ca-certificates.crt'}, clear=True)
+    def test_tls_verification_setting(self):
+        self.assertIs(cx.tls_verify(''), True)
+        self.assertIs(cx.tls_verify('False'), False)
+        with self.assertRaises(cx.ExportError):
+            cx.tls_verify('/no/such/ca.pem')
+        with tempfile.TemporaryDirectory() as tmp:
+            bundle = Path(tmp) / 'ca.pem'
+            bundle.write_text('placeholder')
+            self.assertEqual(cx.tls_verify(str(bundle)), str(bundle))
+            with patch.object(cx, 'DEFAULT_CONFIG', Path(tmp) / 'missing.ini'):
+                with patch.dict('os.environ', {'CX_VERIFY_SSL': 'false'}), patch('sys.stderr'):
+                    client = cx.Client()
+                self.assertIs(client.verify, False)
+                self.assertIs(cx.Client(insecure=False).verify, True)
+                with patch('sys.stderr'):
+                    self.assertIs(cx.Client(insecure=True).verify, False)
+        # verify=False must be sent per request: REQUESTS_CA_BUNDLE overrides a session-level False.
+        client.http = Mock()
+        client.http.post.return_value = self.response(200, {'access_token': 't', 'expires_in': 300})
+        client.http.request.return_value = self.response(200, {'ok': True})
+        client.api('GET', '/api/projects')
+        self.assertIs(client.http.post.call_args.kwargs['verify'], False)
+        self.assertIs(client.http.request.call_args.kwargs['verify'], False)
 
     def test_https(self):
         for url in ['http://example.com', 'https://user:password@example.com']:

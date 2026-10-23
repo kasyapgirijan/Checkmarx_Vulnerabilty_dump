@@ -9,12 +9,14 @@ import json
 import os
 import sys
 import time
+import warnings
 from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import quote, urljoin, urlsplit
 
 import requests
 from requests.adapters import HTTPAdapter
+from urllib3.exceptions import InsecureRequestWarning
 from urllib3.util.retry import Retry
 
 DEFAULT_CONFIG = Path(__file__).resolve().with_name('config.ini')
@@ -28,7 +30,8 @@ ECOSYSTEM_ALIASES = {'node': 'npm', 'nodejs': 'npm', 'python': 'pypi'}
 # Expected, recoverable failures for a single project/scan; anything else is a bug.
 RECOVERABLE = (requests.RequestException, KeyError, ValueError, TypeError)
 ENV_KEYS = {'base_url': 'CX_BASE_URL', 'token_url': 'CX_TOKEN_URL', 'api_key': 'CX_API_KEY',
-            'client_id': 'CX_CLIENT_ID', 'client_secret': 'CX_CLIENT_SECRET'}
+            'client_id': 'CX_CLIENT_ID', 'client_secret': 'CX_CLIENT_SECRET',
+            'verify_ssl': 'CX_VERIFY_SSL'}
 
 
 class ExportError(Exception):
@@ -54,6 +57,23 @@ def session():
         total=4, backoff_factor=1, status_forcelist=[429, 502, 503, 504],
         allowed_methods=['GET'], respect_retry_after_header=True)))
     return s
+
+
+def tls_verify(value):
+    """verify_ssl setting -> requests verify value: True, False or a CA bundle path."""
+    value = (value or '').strip()
+    if value.lower() in ('', 'true', 'yes', 'on', '1'):
+        return True
+    if value.lower() in ('false', 'no', 'off', '0'):
+        return False
+    path = Path(value).expanduser()
+    if not path.is_file():
+        raise ExportError('verify_ssl must be true, false or the path to a CA bundle (PEM) file')
+    return str(path)
+
+
+def tls_mode(verify):
+    return 'enabled' if verify is True else 'disabled' if verify is False else 'custom_ca_bundle'
 
 
 def decode_json(content, label):
@@ -95,6 +115,7 @@ def load_settings(config_path=None):
         raise ExportError('Set api_key in config.ini (or CX_API_KEY), or provide client_id and client_secret')
     if result['api_key'].startswith('YOUR_'):
         raise ExportError('Replace the api_key placeholder in your local config.ini')
+    result['verify_ssl'] = tls_verify(result['verify_ssl'])
     return result
 
 
@@ -109,8 +130,15 @@ def token_client_id(api_key):
 
 
 class Client:
-    def __init__(self, config_path=None):
+    def __init__(self, config_path=None, insecure=False):
         settings = load_settings(config_path)
+        # Passed on every request: a session-level verify=False is silently
+        # overridden by REQUESTS_CA_BUNDLE/CURL_CA_BUNDLE in requests.
+        self.verify = False if insecure else settings['verify_ssl']
+        if self.verify is False:
+            warnings.simplefilter('ignore', InsecureRequestWarning)
+            print('WARNING: TLS certificate verification is disabled; the API key and results '
+                  'are exposed to anyone able to intercept this network traffic.', file=sys.stderr)
         self.base = https_url(settings['base_url'])
         self.token_url = https_url(settings['token_url'])
         self.api_key = settings['api_key']
@@ -129,7 +157,7 @@ class Client:
                         client_id=self.client_id or token_client_id(self.api_key))
         else:
             data = dict(grant_type='client_credentials', client_id=self.client_id, client_secret=self.secret)
-        response = self.http.post(self.token_url, data=data, allow_redirects=False,
+        response = self.http.post(self.token_url, data=data, allow_redirects=False, verify=self.verify,
                                   timeout=(CONNECT_TIMEOUT, READ_TIMEOUT))
         result = checked_json(response, 'Authentication')
         if not result.get('access_token'):
@@ -142,7 +170,7 @@ class Client:
         for attempt in range(2):
             if time.monotonic() >= self.expires:
                 self.authenticate()
-            response = self.http.request(method, self.base + path, allow_redirects=False,
+            response = self.http.request(method, self.base + path, allow_redirects=False, verify=self.verify,
                                          headers={'Authorization': 'Bearer ' + self.token},
                                          timeout=(CONNECT_TIMEOUT, READ_TIMEOUT), **kwargs)
             if response.status_code != 401 or attempt:
@@ -221,7 +249,7 @@ class Client:
                 response = self.send('GET', location[len(self.base):])
             else:
                 # Other hosts (e.g. signed storage URLs) never receive API credentials.
-                response = self.download.get(https_url(location), allow_redirects=False,
+                response = self.download.get(https_url(location), allow_redirects=False, verify=self.verify,
                                              timeout=(CONNECT_TIMEOUT, READ_TIMEOUT))
         if response.status_code != 200:
             raise ExportError(f'Report download: HTTP {response.status_code}')
@@ -432,6 +460,8 @@ def parse_args(argv=None):
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument('--out', default='checkmarx-output')
     p.add_argument('--config', type=Path, help='INI path; default config.ini beside this script, then environment fallback')
+    p.add_argument('--insecure', action='store_true',
+                   help='Disable TLS certificate verification (prefer verify_ssl = /path/to/ca.pem)')
     p.add_argument('--project', help='Case-insensitive project name substring')
     p.add_argument('--branch', help='Exact branch; default: latest completed SCA for each observed branch')
     p.add_argument('--ecosystems', default='', help='Comma-separated purl ecosystems; npm,pypi (or nodejs,python). Default all')
@@ -550,7 +580,7 @@ def coverage_gap(row):
 
 def main(argv=None):
     args = parse_args(argv)
-    client = Client(args.config)
+    client = Client(args.config, insecure=args.insecure)
     product_map = load_product_map(args.product_map)
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=False)  # Separate evidence per run; do not mix old/new exports.
@@ -594,6 +624,7 @@ def main(argv=None):
                'metadata_errors': metadata_errors, 'visible_applications': len(applications),
                'scan_records': csvs['scans'].count,
                'metadata_time_basis': 'Application associations and project/application tags are current at export, not historical',
+               'tls_verification': tls_mode(client.verify),
                'runtime_assessment': 'Not performed; npm/pypi presence does not identify deployed runtimes',
                'limitations': ['Not a production deployment inventory', 'No new scans or vulnerability recalculation are triggered',
                                'No matches does not establish absence of exposure', 'Missing vulnerability section is unknown coverage']}

@@ -161,8 +161,23 @@ read -rsp 'Checkmarx API key: ' CX_API_KEY
 export CX_API_KEY
 ```
 
-TLS verification stays enabled. If a corporate proxy needs a trusted CA, configure
-REQUESTS_CA_BUNDLE with your organization's PEM bundle and HTTPS_PROXY if needed.
+TLS verification is enabled by default. SSL errors such as
+`CERTIFICATE_VERIFY_FAILED` usually mean a corporate proxy or firewall re-signs
+HTTPS traffic with your organization's own CA. Preferred fix: export that root CA
+as a PEM file (ask IT, or export it from your browser's certificate viewer) and set
+
+```ini
+verify_ssl = C:\Secure\corporate-root-ca.pem
+```
+
+in `config.ini` (or CX_VERIFY_SSL). Configure HTTPS_PROXY if a proxy is required.
+
+If you accept the risk on a trusted network, verification can be disabled with
+`verify_ssl = false` in `config.ini`, `CX_VERIFY_SSL=false`, or `--insecure` for a
+single run. A warning is printed and `run.json` records `tls_verification:
+disabled`. Without verification, anyone able to intercept the traffic can capture
+your API key and the exported vulnerability data, so rotate the key if the
+network later turns out to be untrusted.
 
 ## Run
 
