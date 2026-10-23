@@ -1,0 +1,235 @@
+# Checkmarx One product exposure exporter — v2
+
+## Full dump with applications and tags
+
+After configuring credentials below, run:
+
+```powershell
+python checkmarx_exposure.py --dump-all --out checkmarx-full-dump
+```
+
+This includes all visible projects and applications, all retained scan metadata,
+and both CycloneDX and original SCA JSON reports for every scan with a confirmed
+completed SCA engine. All package ecosystems, severities and dependency scopes are
+included. Failed/incomplete/non-SCA scans remain in scans.csv and coverage.csv;
+they cannot supply completed SCA reports. Filters cannot be used with --dump-all.
+
+This is a full **SCA exposure dump plus application/project/scan metadata**, not a
+backup of source code or SAST/DAST/container finding details. Deleted or expired
+records and data outside the API identity's permissions are unavailable.
+Historical scans can make this substantially slower than the default latest-scan
+mode and create repeated package/finding rows across scan IDs. No resume mode is
+implemented; retain completed raw files if a run is interrupted.
+
+New exports:
+
+| File | Contents |
+| --- | --- |
+| applications.csv | Application IDs, names, tags, descriptions, criticality and project IDs |
+| projects.csv | Project inventory, project tags and associated applications |
+| application_projects.csv | One row per application/project association |
+| scans.csv | All retrieved scan metadata, statuses, engine statuses and scan tags |
+| raw/applications.json | Original application list records |
+| raw/projects.json | Original project list records |
+| raw/scans-PROJECT_ID.jsonl | Original scan records, saved as retrieved |
+
+Application IDs/names/tags and project/scan tags also accompany package and finding
+rows. Tags stay as JSON to preserve keys, empty values and differing tags at each
+level. Application name/tag objects are keyed by application ID; memberships do
+not duplicate findings. Use application_projects.csv as a bridge in Power BI.
+Associations are joined from application projectIds and project applicationIds,
+not guessed from names or locally re-evaluated rules. Missing schemas, inaccessible
+applications and unresolved IDs are flagged, and application retrieval errors are
+recorded in run.json. Project export continues when application retrieval fails.
+
+Application memberships and project/application tags reflect the **current export
+snapshot**, not their historical state at scan time. Scan tags are the values
+returned on the scan record. An explicit product-map still determines product;
+applications are separate fields because one project may belong to multiple apps.
+
+The default mode still exports only the latest completed SCA scan per branch;
+application and tag enrichment is enabled in both modes.
+
+
+Identify projects containing dependencies that Checkmarx reports as vulnerable.
+Python 3.10 or newer; Windows, Linux or macOS.
+
+## What it does
+
+- Enumerates all projects visible to your API identity (or a name filter).
+- Paginates scan history and selects the newest scan whose SCA engine explicitly
+  completed, separately for every observed branch, or one exact branch you select.
+- Generates CycloneDX JSON through the SCA Export Service and joins vulnerability
+  `affects.ref` values to component `bom-ref` values. It does not guess affected
+  versions or infer CVEs from language names.
+- Includes development/test dependencies; preserves available scope and analysis state.
+- Writes the original SBOM, packages.csv, findings.csv, matches.csv, coverage.csv,
+  and run.json. Optionally exports the vendor's ScanReportJson as additional evidence.
+- Does not start scans, modify findings, or change project settings. POST requests
+  authenticate and generate exports only.
+
+**This identifies reported dependency exposure, not verified production exposure.**
+An npm dependency is not evidence of a particular deployed Node.js version, nor is
+an installed Python package evidence of a particular Python interpreter version.
+For Node.js/Python interpreter advisories, separately collect exact runtime versions
+from deployed hosts or container image inventories and evaluate the advisory's
+version ranges. This exporter does not perform that runtime assessment.
+
+## Configure locally
+
+Install the dependency:
+
+```powershell
+python -m pip install -r requirements.txt
+```
+
+Set your actual regional Checkmarx API origin and full token endpoint. Copy them
+from your Checkmarx integration configuration; the examples below are EU examples,
+not a determination of your tenant's location. The token URL includes the tenant.
+Do not append `/api` to CX_BASE_URL.
+
+```powershell
+$env:CX_BASE_URL = "https://eu.ast.checkmarx.net"
+$env:CX_TOKEN_URL = "https://eu.iam.checkmarx.net/auth/realms/YOUR_TENANT/protocol/openid-connect/token"
+$env:CX_API_KEY = Read-Host "Checkmarx API key" -MaskInput
+```
+
+`-MaskInput` requires PowerShell 7.1+. On Windows PowerShell 5.1, use:
+
+```powershell
+$secret = Read-Host "Checkmarx API key" -AsSecureString
+$env:CX_API_KEY = [System.Net.NetworkCredential]::new("", $secret).Password
+```
+
+Alternatively, omit CX_API_KEY and supply CX_CLIENT_ID and CX_CLIENT_SECRET for an
+OAuth service client. If both methods are configured, CX_API_KEY takes precedence.
+For API key authentication, CX_CLIENT_ID can override the key's azp/default ast-app.
+Access tokens renew during a run. Credentials are not written into outputs.
+Use an identity authorized to read the required projects/scans and generate SCA
+exports. SCA must be licensed/enabled and scans must have usable SCA results.
+
+Linux/macOS:
+
+```bash
+export CX_BASE_URL='https://eu.ast.checkmarx.net'
+export CX_TOKEN_URL='https://eu.iam.checkmarx.net/auth/realms/YOUR_TENANT/protocol/openid-connect/token'
+read -rsp 'Checkmarx API key: ' CX_API_KEY
+export CX_API_KEY
+```
+
+TLS verification stays enabled. If a corporate proxy needs a trusted CA, configure
+REQUESTS_CA_BUNDLE with your organization's PEM bundle and HTTPS_PROXY if needed.
+
+## Run
+
+Start with one product to validate access and output:
+
+```powershell
+python checkmarx_exposure.py --project "Product A" --ecosystems npm,pypi --raw-scan-report --out pilot
+```
+
+Then export all visible projects:
+
+```powershell
+python checkmarx_exposure.py --ecosystems npm,pypi --out all-products
+```
+
+Search an exact CVE (replace the illustrative ID):
+
+```powershell
+python checkmarx_exposure.py --cve CVE-YYYY-NNNNN --out cve-review
+```
+
+Search vulnerable instances of a package:
+
+```powershell
+python checkmarx_exposure.py --package django --ecosystems pypi --out django-review
+```
+
+Restrict to a known release branch if appropriate:
+
+```powershell
+python checkmarx_exposure.py --branch release/2026.1 --out release-review
+```
+
+Each --out directory must be new. This prevents old exports mixing with a later run.
+No branch is implicitly assumed to be production. Without --branch, every observed
+branch is included, so old feature branches can legitimately be marked stale.
+Fetching full scan history can take time on large tenants; --project is useful
+for a pilot. Deleted/retained-out scans cannot be recovered by this script.
+
+## Map technical projects to business products
+
+Provide a CSV with exact project UUIDs (multiple projects may map to one product):
+
+```csv
+project_id,product
+REPLACE_WITH_PROJECT_UUID,Product A
+```
+
+Use `--product-map products.csv`. Without a mapping, the project name is used and
+`product_mapping` is explicitly `project_name_fallback`. The script does not assume
+that a Checkmarx project or application necessarily equals a commercial product.
+
+## Read the outputs
+
+| File | Purpose |
+| --- | --- |
+| packages.csv | Full package inventory; use this to find usage even without a reported CVE |
+| findings.csv | All exported vulnerability/component associations; includes triage state |
+| matches.csv | Finding rows matching --ecosystems, --package and --cve (AND logic) |
+| coverage.csv | One record per project/branch, plus project-level retrieval errors |
+| raw/*.cdx.json | Original CycloneDX evidence for each selected scan |
+| raw/*.scan-report.json | Optional original Checkmarx scan report |
+| run.json | Run timestamp, scope, filters and limitations |
+
+Filters affect matches.csv only. Full inventory and findings remain available.
+Ecosystems use package URL types: npm = JavaScript/Node ecosystem; pypi = Python.
+Other ecosystems are included when --ecosystems is omitted. Packages lacking a
+purl are `unknown`; inspect them rather than assuming they are irrelevant.
+An unresolved vulnerability reference is retained in findings.csv with unknown
+package fields and flagged in coverage.csv. Ecosystem/package filters may exclude
+these unresolved rows; always review the unfiltered findings and coverage.
+
+Severity is the highest available reported rating. Ratings are preserved as JSON.
+The recommendation is copied when present, not converted into an invented fixed
+version. Analysis state (for example, not_affected) is preserved; matching rows are
+reported associations, not automatically confirmed exploitable vulnerabilities.
+Rows can repeat across branches. Do not treat row counts as unique CVE counts.
+
+No findings is not proof of safety. A missing vulnerabilities section is explicitly
+`not_provided`, not zero confirmed vulnerabilities. Review the raw scan report/UI
+when this happens. The script does not silently substitute a different JSON schema.
+Stale threshold defaults to 30 days (`--stale-days`). Scan dates represent when the
+source was scanned; no recalculation against newer intelligence is triggered.
+`newer_scan_than_selected` means a newer scan exists than the completed SCA evidence
+used and warrants review (it may have failed, be in progress, or lack SCA).
+
+Exit codes: 0 = exports completed with fresh, linked evidence and no flagged gaps;
+2 = files produced with coverage warnings/errors; 1 = fatal setup/request error.
+Even exit 0 does not mean the product is safe or runtimes have been assessed.
+API visibility limits mean undisclosed/inaccessible projects cannot be enumerated.
+
+CSV cells beginning with spreadsheet formula characters receive a leading apostrophe.
+Raw JSON retains the original values. Treat outputs as internal security information.
+Downloads intentionally do not forward API tokens to signed download URLs. An
+unexpected redirect/download format fails visibly rather than silently authenticating
+to another host. If your tenant returns a different export format, retain the raw
+report and adapt the parser against a sanitized sample.
+
+## Validation and sources
+
+Validated locally with mocked API responses and synthetic CycloneDX fixtures:
+pagination, failed-SCA fallback per branch, scoped package/CVE matching, unresolved
+references, missing vulnerability data, report polling and separated download auth.
+No live tenant credentials were used, so live integration remains to be validated.
+
+Run tests: `python -m unittest -v test_checkmarx_exposure.py`.
+
+API behavior checked against:
+- https://docs.checkmarx.com/en/34965-145615-checkmarx-sca--rest--api---export-service.html
+- https://github.com/Checkmarx/ast-cli/blob/main/internal/wrappers/scans.go
+- https://github.com/Checkmarx/ast-cli/blob/main/internal/wrappers/projects.go
+- https://github.com/Checkmarx/ast-cli/blob/main/internal/wrappers/export-http.go
+- https://github.com/Checkmarx/ast-cli/blob/main/internal/wrappers/client.go
+- https://docs.checkmarx.com/en/34965-68618-generating-an-api-key.html
