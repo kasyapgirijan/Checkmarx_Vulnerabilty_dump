@@ -2,6 +2,7 @@
 """Export Checkmarx One SCA evidence. Python 3.10+, requests. See README.md."""
 import argparse
 import base64
+import configparser
 import csv
 import json
 import os
@@ -45,15 +46,48 @@ def checked_json(response, label):
         raise ExportError(f'{label}: invalid JSON') from None
 
 
+DEFAULT_CONFIG = Path(__file__).resolve().with_name('config.ini')
+
+
+def load_settings(config_path=None):
+    """Read local INI settings; non-empty environment values override file values."""
+    path = Path(config_path).expanduser() if config_path is not None else DEFAULT_CONFIG
+    values = {}
+    if path.exists():
+        parser = configparser.ConfigParser(interpolation=None)
+        try:
+            with path.open(encoding='utf-8-sig') as config_file:
+                parser.read_file(config_file)
+            if not parser.has_section('checkmarx'):
+                raise ExportError('Config must contain a [checkmarx] section')
+            values = dict(parser['checkmarx'])
+        except (configparser.Error, OSError, UnicodeError):
+            # Parser errors can include full lines containing secrets.
+            raise ExportError('Cannot read config: check file permissions and INI syntax') from None
+    elif config_path is not None:
+        raise ExportError('Specified config file does not exist')
+    keys = {'base_url': 'CX_BASE_URL', 'token_url': 'CX_TOKEN_URL',
+            'api_key': 'CX_API_KEY', 'client_id': 'CX_CLIENT_ID',
+            'client_secret': 'CX_CLIENT_SECRET'}
+    result = {key: (os.getenv(env) or values.get(key, '')).strip() for key, env in keys.items()}
+    for key in ('base_url', 'token_url'):
+        if not result[key]:
+            raise ExportError('Missing ' + key + ': set it in config.ini or ' + keys[key])
+    if not result['api_key'] and not (result['client_id'] and result['client_secret']):
+        raise ExportError('Set api_key in config.ini (or CX_API_KEY), or provide client_id and client_secret')
+    if result['api_key'].startswith('YOUR_'):
+        raise ExportError('Replace the api_key placeholder in your local config.ini')
+    return result
+
+
 class Client:
-    def __init__(self):
-        self.base = https_url(os.environ['CX_BASE_URL'])
-        self.token_url = https_url(os.environ['CX_TOKEN_URL'])
-        self.api_key = os.getenv('CX_API_KEY')
-        self.client_id = os.getenv('CX_CLIENT_ID')
-        self.secret = os.getenv('CX_CLIENT_SECRET')
-        if not self.api_key and not (self.client_id and self.secret):
-            raise ExportError('Set CX_API_KEY or both CX_CLIENT_ID and CX_CLIENT_SECRET')
+    def __init__(self, config_path=None):
+        settings = load_settings(config_path)
+        self.base = https_url(settings['base_url'])
+        self.token_url = https_url(settings['token_url'])
+        self.api_key = settings['api_key']
+        self.client_id = settings['client_id']
+        self.secret = settings['client_secret']
         self.http = session()
         self.download = session()  # Never receives a Checkmarx Authorization header.
         self.token = ''
@@ -270,6 +304,7 @@ def all_scan_selections(scans):
 def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument('--out', default='checkmarx-output')
+    p.add_argument('--config', type=Path, help='INI path; default config.ini beside this script, then environment fallback')
     p.add_argument('--project', help='Case-insensitive project name substring')
     p.add_argument('--branch', help='Exact branch; default: latest completed SCA for each observed branch')
     p.add_argument('--ecosystems', default='', help='Comma-separated purl ecosystems; npm,pypi (or nodejs,python). Default all')
@@ -287,6 +322,7 @@ def main():
         args.raw_scan_report = True
     if args.stale_days < 0 or args.export_timeout <= 0:
         p.error('stale-days must be >= 0 and export-timeout > 0')
+    client = Client(args.config)
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=False)  # Separate evidence per run; do not mix old/new exports.
     (out / 'raw').mkdir()
@@ -294,7 +330,6 @@ def main():
     if args.product_map:
         with args.product_map.open(encoding='utf-8-sig', newline='') as f:
             product_map = {r['project_id']: r['product'] for r in csv.DictReader(f)}
-    client = Client()
     projects = list(client.pages('/api/projects', 'projects'))
     projects = [x for x in projects if not args.project or args.project.lower() in x['name'].lower()]
     if not projects:

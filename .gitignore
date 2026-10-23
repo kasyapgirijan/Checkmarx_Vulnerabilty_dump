@@ -9,3 +9,7 @@ __pycache__/
 *.zip
 checkmarx-output/
 checkmarx-full-dump/
+
+# Local credentials; publish only the placeholder template
+*.ini
+!config.example.ini

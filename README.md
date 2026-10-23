@@ -75,7 +75,45 @@ For Node.js/Python interpreter advisories, separately collect exact runtime vers
 from deployed hosts or container image inventories and evaluate the advisory's
 version ranges. This exporter does not perform that runtime assessment.
 
-## Configure locally
+## Config file (recommended)
+
+Copy the template and edit the local file:
+
+```powershell
+Copy-Item config.example.ini config.ini
+notepad config.ini
+```
+
+Set `base_url`, `token_url` (including your tenant), and `api_key` under
+`[checkmarx]`. Use the full API key token, not its portal Key ID. Values must be
+on one line without quotes. The URLs in the example are EU examples; use your
+actual region. No credentials need to be entered in the source code.
+
+```powershell
+python -m pip install -r requirements.txt
+python checkmarx_exposure.py --dump-all --out checkmarx-full-dump
+```
+
+The script automatically reads `config.ini` beside `checkmarx_exposure.py`,
+regardless of your terminal's working directory. For another path:
+
+```powershell
+python checkmarx_exposure.py --config "C:\Secure\checkmarx.ini" --dump-all --out checkmarx-full-dump
+```
+
+**Non-empty CX_* environment variables override corresponding config values.**
+If settings seem stale, clear those environment variables or update them.
+Without the default file, the previous environment-only setup still works.
+An explicitly requested missing/malformed config file produces an error.
+For OAuth client credentials, leave `api_key` empty and populate `client_id` and
+`client_secret`; also clear CX_API_KEY if it was previously set.
+
+The local file stores your key in plaintext. Restrict access to your account.
+All `*.ini` files are ignored by Git except `config.example.ini`, which must
+contain placeholders only. Do not force-add a real config to this public repo.
+The config and key are never copied into exported reports or error messages.
+
+## Environment variables (alternative)
 
 Install the dependency:
 

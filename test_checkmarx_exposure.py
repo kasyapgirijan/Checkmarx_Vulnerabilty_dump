@@ -113,6 +113,39 @@ class Tests(unittest.TestCase):
             self.assertTrue((out / 'applications.csv').exists())
             self.assertEqual(len((out / 'raw' / 'scans-p.jsonl').read_text().splitlines()), 3)
 
+    @patch.dict('os.environ', {}, clear=True)
+    def test_ini_config_and_precedence(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / 'config.ini'
+            path.write_text('[checkmarx]\nbase_url = https://example.com\ntoken_url = https://iam.example.com/token\napi_key = test%literal#token\n')
+            settings = cx.load_settings(path)
+            self.assertEqual(settings['api_key'], 'test%literal#token')
+            with patch.dict('os.environ', {'CX_API_KEY': 'env-token'}):
+                self.assertEqual(cx.load_settings(path)['api_key'], 'env-token')
+            with patch.object(cx, 'DEFAULT_CONFIG', path):
+                self.assertEqual(cx.load_settings()['base_url'], 'https://example.com')
+
+    @patch.dict('os.environ', {}, clear=True)
+    def test_config_errors_redact_secrets(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / 'config.ini'
+            with self.assertRaisesRegex(cx.ExportError, 'does not exist'):
+                cx.load_settings(path)
+            path.write_text('[checkmarx]\napi_key = PRIVATE_VALUE\nPRIVATE_VALUE\n')
+            with self.assertRaises(cx.ExportError) as result:
+                cx.load_settings(path)
+            self.assertNotIn('PRIVATE_VALUE', str(result.exception))
+            path.write_text('[checkmarx]\napi_key = test\n')
+            with self.assertRaisesRegex(cx.ExportError, 'Missing base_url'):
+                cx.load_settings(path)
+
+    @patch.dict('os.environ', {'CX_BASE_URL': 'https://example.com',
+        'CX_TOKEN_URL': 'https://iam.example.com/token', 'CX_API_KEY': 'test'}, clear=True)
+    def test_environment_only_compatibility(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch.object(cx, 'DEFAULT_CONFIG', Path(tmp) / 'missing.ini'):
+                self.assertEqual(cx.load_settings()['api_key'], 'test')
+
     def test_https(self):
         for url in ['http://example.com', 'https://user:password@example.com']:
             with self.assertRaises(cx.ExportError):
