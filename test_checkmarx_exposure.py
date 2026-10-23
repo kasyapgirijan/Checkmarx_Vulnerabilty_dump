@@ -79,6 +79,7 @@ class Tests(unittest.TestCase):
     def export_client(self, responses):
         client = cx.Client.__new__(cx.Client)
         client.base = 'https://eu.ast.checkmarx.net'
+        client.verify = True
         client.send = Mock(side_effect=responses)
         client.download = Mock()
         return client
@@ -136,6 +137,7 @@ class Tests(unittest.TestCase):
     def test_dump_all_end_to_end(self, constructor):
         import csv
         client = constructor.return_value
+        client.verify = True
         scans = [{'id': 's1', 'branch': 'main', 'createdAt': '2026-10-01T00:00:00Z',
                   'statusDetails': [{'name': 'sca', 'status': 'Completed'}], 'tags': {'build': '1'}},
                  {'id': 's2', 'branch': 'main', 'createdAt': '2026-10-02T00:00:00Z',
@@ -166,6 +168,24 @@ class Tests(unittest.TestCase):
             with (out / 'coverage.csv').open(encoding='utf-8-sig') as f:
                 roles = {r['scan_id']: r['scan_role'] for r in csv.DictReader(f)}
             self.assertEqual(roles, {'s4': 'historical', 's3': 'current', 's2': 'historical', 's1': 'historical'})
+
+    def test_project_filters(self):
+        apps = cx.ApplicationIndex([{'id': 'a1', 'name': 'Payments', 'projectIds': ['p1']}])
+        projects = [{'id': 'p1', 'name': 'pay-api', 'tags': {'Team': 'Blue', 'pci': ''}, 'groups': ['g-eu']},
+                    {'id': 'p2', 'name': 'web', 'tags': {'team': 'red'}, 'applicationIds': ['a2'], 'groups': []},
+                    {'id': 'p3', 'name': 'tool', 'tags': None}]
+        def pick(**kw):
+            args = argparse.Namespace(**{'project': None, 'tag': None, 'application': None, 'group': None, **kw})
+            return [p['id'] for p in projects if cx.project_filter(args, apps)(p)]
+        self.assertEqual(pick(), ['p1', 'p2', 'p3'])
+        self.assertEqual(pick(tag=['team=blue']), ['p1'])
+        self.assertEqual(pick(tag=['TEAM']), ['p1', 'p2'])  # Key only, any value.
+        self.assertEqual(pick(tag=['pci']), ['p1'])  # Key-only tag with empty value.
+        self.assertEqual(pick(tag=['team=blue', 'team=red']), ['p1', 'p2'])  # Repeats are OR.
+        self.assertEqual(pick(tag=['team'], application=['payments']), ['p1'])  # Types are AND.
+        self.assertEqual(pick(application=['a2']), ['p2'])  # By ID from project applicationIds.
+        self.assertEqual(pick(group=['G-EU']), ['p1'])
+        self.assertEqual(pick(project='WEB', tag=['team=blue']), [])
 
     def test_coverage_gap(self):
         current = {'scan_role': 'current', 'status': 'exported', 'vulnerability_section': 'present',
@@ -207,6 +227,52 @@ class Tests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             with patch.object(cx, 'DEFAULT_CONFIG', Path(tmp) / 'missing.ini'):
                 self.assertEqual(cx.load_settings()['api_key'], 'test')
+
+    @patch.dict('os.environ', {'CX_BASE_URL': 'https://example.com', 'CX_TOKEN_URL': 'https://iam.example.com/token',
+        'CX_API_KEY': 'test', 'REQUESTS_CA_BUNDLE': '/etc/ssl/certs/ca-certificates.crt'}, clear=True)
+    def test_tls_verification_setting(self):
+        self.assertIs(cx.tls_verify(''), True)
+        self.assertIs(cx.tls_verify('False'), False)
+        with self.assertRaises(cx.ExportError):
+            cx.tls_verify('/no/such/ca.pem')
+        with tempfile.TemporaryDirectory() as tmp:
+            bundle = Path(tmp) / 'ca.pem'
+            bundle.write_text('placeholder')
+            self.assertEqual(cx.tls_verify(str(bundle)), str(bundle))
+            with patch.object(cx, 'DEFAULT_CONFIG', Path(tmp) / 'missing.ini'):
+                with patch.dict('os.environ', {'CX_VERIFY_SSL': 'false'}), patch('sys.stderr'):
+                    client = cx.Client()
+                self.assertIs(client.verify, False)
+                self.assertIs(cx.Client(insecure=False).verify, True)
+                with patch('sys.stderr'):
+                    self.assertIs(cx.Client(insecure=True).verify, False)
+        # verify=False must be sent per request: REQUESTS_CA_BUNDLE overrides a session-level False.
+        client.http = Mock()
+        client.http.post.return_value = self.response(200, {'access_token': 't', 'expires_in': 300})
+        client.http.request.return_value = self.response(200, {'ok': True})
+        client.api('GET', '/api/projects')
+        self.assertIs(client.http.post.call_args.kwargs['verify'], False)
+        self.assertIs(client.http.request.call_args.kwargs['verify'], False)
+
+    def test_relaxed_tls_session(self):
+        adapter = cx.session(False).get_adapter('https://eu.ast.checkmarx.net')
+        self.assertIsInstance(adapter, cx.RelaxedTLSAdapter)
+        ctx = adapter.poolmanager.connection_pool_kw['ssl_context']
+        self.assertEqual((ctx.check_hostname, ctx.verify_mode), (False, cx.ssl.CERT_NONE))
+        self.assertTrue(ctx.options & getattr(cx.ssl, 'OP_LEGACY_SERVER_CONNECT', 0x4))
+        self.assertNotIsInstance(cx.session(True).get_adapter('https://x.example'), cx.RelaxedTLSAdapter)
+
+    def test_connection_errors_are_diagnosable_but_redacted(self):
+        exc = cx.requests.exceptions.SSLError(
+            "HTTPSConnectionPool(host='eu.ast.checkmarx.net', port=443): Max retries exceeded with url: "
+            "/r?sig=SECRET (Caused by SSLError(SSLCertVerificationError('certificate verify failed')))")
+        text = cx.safe_error(exc)
+        self.assertIn('certificate verify failed', text)
+        self.assertIn('eu.ast.checkmarx.net', text)
+        self.assertNotIn('SECRET', text)
+        proxy = cx.safe_error(cx.requests.exceptions.ProxyError('Cannot connect to proxy http://bob:pw@proxy:8080'))
+        self.assertNotIn('pw', proxy)
+        self.assertEqual(cx.safe_error(KeyError('x')), 'KeyError')
 
     def test_https(self):
         for url in ['http://example.com', 'https://user:password@example.com']:

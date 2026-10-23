@@ -7,14 +7,18 @@ import contextlib
 import csv
 import json
 import os
+import re
+import ssl
 import sys
 import time
+import warnings
 from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import quote, urljoin, urlsplit
 
 import requests
 from requests.adapters import HTTPAdapter
+from urllib3.exceptions import InsecureRequestWarning
 from urllib3.util.retry import Retry
 
 DEFAULT_CONFIG = Path(__file__).resolve().with_name('config.ini')
@@ -28,7 +32,8 @@ ECOSYSTEM_ALIASES = {'node': 'npm', 'nodejs': 'npm', 'python': 'pypi'}
 # Expected, recoverable failures for a single project/scan; anything else is a bug.
 RECOVERABLE = (requests.RequestException, KeyError, ValueError, TypeError)
 ENV_KEYS = {'base_url': 'CX_BASE_URL', 'token_url': 'CX_TOKEN_URL', 'api_key': 'CX_API_KEY',
-            'client_id': 'CX_CLIENT_ID', 'client_secret': 'CX_CLIENT_SECRET'}
+            'client_id': 'CX_CLIENT_ID', 'client_secret': 'CX_CLIENT_SECRET',
+            'verify_ssl': 'CX_VERIFY_SSL'}
 
 
 class ExportError(Exception):
@@ -37,7 +42,16 @@ class ExportError(Exception):
 
 def safe_error(exc):
     # requests exception text can contain signed URLs or tokens; never log/CSV it.
-    return str(exc) if isinstance(exc, ExportError) else type(exc).__name__
+    if isinstance(exc, ExportError):
+        return str(exc)
+    if isinstance(exc, requests.ConnectionError):  # Includes SSLError and ProxyError.
+        # Keep host and the underlying reason (needed to diagnose TLS/proxy problems),
+        # but drop request paths, query strings and proxy credentials.
+        text = re.sub(r'url: \S+', 'url: <redacted>', str(exc))
+        text = re.sub(r'\?[^\s\'"]*', '', text)
+        text = re.sub(r'//[^/\s@]+@', '//', text)
+        return f'{type(exc).__name__}: {text[:400]}'
+    return type(exc).__name__
 
 
 def https_url(value):
@@ -47,13 +61,58 @@ def https_url(value):
     return value.rstrip('/')
 
 
-def session():
+def relaxed_tls_context():
+    """No certificate/hostname checks and tolerant handshakes, for TLS-inspecting proxies."""
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    ctx.options |= getattr(ssl, 'OP_LEGACY_SERVER_CONNECT', 0x4)  # Older proxies.
+    with contextlib.suppress(ValueError, ssl.SSLError):
+        ctx.minimum_version = ssl.TLSVersion.TLSv1
+    with contextlib.suppress(ssl.SSLError):
+        ctx.set_ciphers('DEFAULT:@SECLEVEL=0')
+    return ctx
+
+
+class RelaxedTLSAdapter(HTTPAdapter):
+    def __init__(self, **kwargs):
+        self.ssl_context = relaxed_tls_context()
+        super().__init__(**kwargs)
+
+    def init_poolmanager(self, *args, **kwargs):
+        kwargs['ssl_context'] = self.ssl_context
+        return super().init_poolmanager(*args, **kwargs)
+
+    def proxy_manager_for(self, proxy, **kwargs):
+        kwargs['ssl_context'] = self.ssl_context
+        return super().proxy_manager_for(proxy, **kwargs)
+
+
+def session(verify=True):
     s = requests.Session()
     # POSTs are deliberately not retried here: they can create duplicate export jobs.
-    s.mount('https://', HTTPAdapter(max_retries=Retry(
-        total=4, backoff_factor=1, status_forcelist=[429, 502, 503, 504],
-        allowed_methods=['GET'], respect_retry_after_header=True)))
+    retry = Retry(total=4, backoff_factor=1, status_forcelist=[429, 502, 503, 504],
+                  allowed_methods=['GET'], respect_retry_after_header=True)
+    s.mount('https://', RelaxedTLSAdapter(max_retries=retry) if verify is False
+            else HTTPAdapter(max_retries=retry))
     return s
+
+
+def tls_verify(value):
+    """verify_ssl setting -> requests verify value: True, False or a CA bundle path."""
+    value = (value or '').strip()
+    if value.lower() in ('', 'true', 'yes', 'on', '1'):
+        return True
+    if value.lower() in ('false', 'no', 'off', '0'):
+        return False
+    path = Path(value).expanduser()
+    if not path.is_file():
+        raise ExportError('verify_ssl must be true, false or the path to a CA bundle (PEM) file')
+    return str(path)
+
+
+def tls_mode(verify):
+    return 'enabled' if verify is True else 'disabled' if verify is False else 'custom_ca_bundle'
 
 
 def decode_json(content, label):
@@ -95,6 +154,7 @@ def load_settings(config_path=None):
         raise ExportError('Set api_key in config.ini (or CX_API_KEY), or provide client_id and client_secret')
     if result['api_key'].startswith('YOUR_'):
         raise ExportError('Replace the api_key placeholder in your local config.ini')
+    result['verify_ssl'] = tls_verify(result['verify_ssl'])
     return result
 
 
@@ -109,15 +169,22 @@ def token_client_id(api_key):
 
 
 class Client:
-    def __init__(self, config_path=None):
+    def __init__(self, config_path=None, insecure=False):
         settings = load_settings(config_path)
+        # Passed on every request: a session-level verify=False is silently
+        # overridden by REQUESTS_CA_BUNDLE/CURL_CA_BUNDLE in requests.
+        self.verify = False if insecure else settings['verify_ssl']
+        if self.verify is False:
+            warnings.simplefilter('ignore', InsecureRequestWarning)
+            print('WARNING: SSL checks are disabled (verify_ssl = false); the API key and results '
+                  'are exposed to anyone able to intercept this network traffic.', file=sys.stderr)
         self.base = https_url(settings['base_url'])
         self.token_url = https_url(settings['token_url'])
         self.api_key = settings['api_key']
         self.client_id = settings['client_id']
         self.secret = settings['client_secret']
-        self.http = session()
-        self.download = session()  # Never receives a Checkmarx Authorization header.
+        self.http = session(self.verify)
+        self.download = session(self.verify)  # Never receives a Checkmarx Authorization header.
         self.token = ''
         self.expires = 0
 
@@ -129,7 +196,7 @@ class Client:
                         client_id=self.client_id or token_client_id(self.api_key))
         else:
             data = dict(grant_type='client_credentials', client_id=self.client_id, client_secret=self.secret)
-        response = self.http.post(self.token_url, data=data, allow_redirects=False,
+        response = self.http.post(self.token_url, data=data, allow_redirects=False, verify=self.verify,
                                   timeout=(CONNECT_TIMEOUT, READ_TIMEOUT))
         result = checked_json(response, 'Authentication')
         if not result.get('access_token'):
@@ -142,7 +209,7 @@ class Client:
         for attempt in range(2):
             if time.monotonic() >= self.expires:
                 self.authenticate()
-            response = self.http.request(method, self.base + path, allow_redirects=False,
+            response = self.http.request(method, self.base + path, allow_redirects=False, verify=self.verify,
                                          headers={'Authorization': 'Bearer ' + self.token},
                                          timeout=(CONNECT_TIMEOUT, READ_TIMEOUT), **kwargs)
             if response.status_code != 401 or attempt:
@@ -221,7 +288,7 @@ class Client:
                 response = self.send('GET', location[len(self.base):])
             else:
                 # Other hosts (e.g. signed storage URLs) never receive API credentials.
-                response = self.download.get(https_url(location), allow_redirects=False,
+                response = self.download.get(https_url(location), allow_redirects=False, verify=self.verify,
                                              timeout=(CONNECT_TIMEOUT, READ_TIMEOUT))
         if response.status_code != 200:
             raise ExportError(f'Report download: HTTP {response.status_code}')
@@ -327,7 +394,7 @@ BASE = META + ['product', 'product_mapping', 'project', 'applications', 'project
 PKG = BASE + ['component_ref', 'package', 'version', 'ecosystem', 'purl', 'scope', 'component_type', 'runtime_verified']
 FIND = PKG + ['vulnerability', 'aliases', 'severity', 'ratings_json', 'analysis_state', 'recommendation', 'affected_versions_json', 'source_url', 'package_link_status']
 COVER = BASE + ['scan_role', 'status', 'latest_scan_id', 'latest_scan_status', 'newer_scan_than_selected', 'vulnerability_section', 'package_count', 'finding_count', 'unresolved_links', 'runtime_verified', 'error']
-PROJECT_FIELDS = ['project_id', 'project', 'applications', 'product', 'product_mapping', 'main_branch', 'repo_url'] + META
+PROJECT_FIELDS = ['project_id', 'project', 'applications', 'product', 'product_mapping', 'main_branch', 'repo_url', 'groups_json'] + META
 LINK_FIELDS = ['application_id', 'application', 'project_id', 'project', 'application_tags_json', 'project_tags_json']
 SCAN_FIELDS = BASE + ['status', 'status_details_json', 'engines_json']
 APP_FIELDS = ['application_id', 'application', 'tags_json', 'project_ids_json', 'description', 'criticality']
@@ -413,6 +480,30 @@ def application_context(project, index):
             'project_tags_json': encoded(project.get('tags'))}
 
 
+def project_filter(args, apps):
+    """Project selection: each option type must match (AND); repeats of one option are alternatives (OR)."""
+    def fold(values):
+        return [v.strip().lower() for v in values or [] if v.strip()]
+    tags = [tuple(t.split('=', 1)) if '=' in t else (t, None) for t in fold(args.tag)]
+    wanted_apps, groups = fold(args.application), fold(args.group)
+
+    def tag_match(project):
+        have = {str(k).lower(): str(v or '').lower() for k, v in (project.get('tags') or {}).items()}
+        return any(k in have and (v is None or have[k] == v) for k, v in tags)
+
+    def app_match(project):
+        ids = set(project.get('applicationIds') or []) | apps.by_project.get(project['id'], set())
+        names = {str(i).lower() for i in ids} | {str(apps.by_id[i].get('name', '')).lower() for i in ids if i in apps.by_id}
+        return bool(names & set(wanted_apps))
+
+    def matches(project):
+        return ((not args.project or args.project.lower() in project['name'].lower()) and
+                (not tags or tag_match(project)) and
+                (not wanted_apps or app_match(project)) and
+                (not groups or bool({str(g).lower() for g in project.get('groups') or []} & set(groups))))
+    return matches
+
+
 def file_stem(identifier):
     # Sanitize IDs for local filenames; the actual ID is preserved in CSV context.
     return ''.join(ch if ch.isalnum() or ch in '-_' else '_' for ch in str(identifier))
@@ -432,7 +523,15 @@ def parse_args(argv=None):
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument('--out', default='checkmarx-output')
     p.add_argument('--config', type=Path, help='INI path; default config.ini beside this script, then environment fallback')
+    p.add_argument('--insecure', action='store_true',
+                   help='Turn off all SSL checks for this run (same as verify_ssl = false)')
     p.add_argument('--project', help='Case-insensitive project name substring')
+    p.add_argument('--tag', action='append', metavar='KEY[=VALUE]',
+                   help='Project tag key, or exact key=value; repeat for alternatives (case-insensitive)')
+    p.add_argument('--application', action='append', metavar='NAME_OR_ID',
+                   help='Exact application name or ID; repeat for alternatives (case-insensitive)')
+    p.add_argument('--group', action='append', metavar='GROUP',
+                   help='Project group as returned by the API; repeat for alternatives (case-insensitive)')
     p.add_argument('--branch', help='Exact branch; default: latest completed SCA for each observed branch')
     p.add_argument('--ecosystems', default='', help='Comma-separated purl ecosystems; npm,pypi (or nodejs,python). Default all')
     p.add_argument('--package', help='Package name substring')
@@ -441,11 +540,12 @@ def parse_args(argv=None):
     p.add_argument('--export-timeout', type=int, default=600, help='Seconds allowed per report export')
     p.add_argument('--product-map', type=Path, help='CSV with project_id,product columns')
     p.add_argument('--raw-scan-report', action='store_true', help='Also download original ScanReportJson for review')
-    p.add_argument('--dump-all', action='store_true', help='All visible projects, retained scans and completed SCA reports; no filters')
+    p.add_argument('--dump-all', action='store_true',
+                   help='All retained scans and completed SCA reports; project filters allowed, branch/finding filters not')
     args = p.parse_args(argv)
     if args.dump_all:
-        if any([args.project, args.branch, args.ecosystems, args.package, args.cve]):
-            p.error('--dump-all cannot be combined with scope or finding filters')
+        if any([args.branch, args.ecosystems, args.package, args.cve]):
+            p.error('--dump-all cannot be combined with --branch or finding filters')
         args.raw_scan_report = True
     if args.stale_days < 0 or args.export_timeout <= 0:
         p.error('stale-days must be >= 0 and export-timeout > 0')
@@ -466,6 +566,7 @@ class Exporter:
                    'product_mapping': 'explicit' if pid in product_map else 'project_name_fallback',
                    'project': project['name'], 'project_id': pid, **application_context(project, apps)}
         self.project_rows.append({**context, 'main_branch': project.get('mainBranch', ''),
+                                  'groups_json': encoded(project.get('groups')),
                                   'repo_url': project.get('repoUrl', '')})
         self.csv['application_projects'].write(
             {'project_id': pid, 'project': project['name'], 'application_id': aid,
@@ -550,23 +651,26 @@ def coverage_gap(row):
 
 def main(argv=None):
     args = parse_args(argv)
-    client = Client(args.config)
+    client = Client(args.config, insecure=args.insecure)
     product_map = load_product_map(args.product_map)
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=False)  # Separate evidence per run; do not mix old/new exports.
     (out / 'raw').mkdir()
-    projects = [x for x in client.pages('/api/projects', 'projects')
-                if not args.project or args.project.lower() in x['name'].lower()]
-    if not projects:
-        raise ExportError('No visible projects matched; check filter and account permissions')
     metadata_errors, applications = [], []
     try:
         applications.extend(client.pages('/api/applications', 'applications'))
         apps = ApplicationIndex(applications)
     except (ExportError, *RECOVERABLE) as exc:
+        if args.application:
+            raise ExportError('Cannot filter by --application: application list unavailable '
+                              f'({safe_error(exc)})') from None
         # Project export continues; mappings are then flagged partial_or_unknown.
         metadata_errors.append({'stage': 'applications', 'error': safe_error(exc)})
         apps = ApplicationIndex([a for a in applications if 'id' in a], complete=False)
+    selected = project_filter(args, apps)
+    projects = [x for x in client.pages('/api/projects', 'projects') if selected(x)]
+    if not projects:
+        raise ExportError('No visible projects matched; check filters and account permissions')
     (out / 'raw' / 'applications.json').write_text(encoded(applications), encoding='utf-8')
     (out / 'raw' / 'projects.json').write_text(encoded(projects), encoding='utf-8')
     write_csv(out / 'applications.csv', (dict(application_id=a['id'], application=a.get('name', ''),
@@ -590,10 +694,13 @@ def main(argv=None):
     summary = {'generated_at': exporter.now.isoformat(), 'visible_projects_in_scope': len(projects),
                'packages': csvs['packages'].count, 'finding_rows': csvs['findings'].count,
                'filters': {'ecosystems': args.ecosystems, 'package': args.package, 'cve': args.cve},
+               'project_filters': {'project': args.project, 'tag': args.tag, 'application': args.application,
+                                   'group': args.group, 'branch': args.branch},
                'scope': 'All retained scans; completed SCA reports' if args.dump_all else 'Latest confirmed completed SCA scan per observed branch',
                'metadata_errors': metadata_errors, 'visible_applications': len(applications),
                'scan_records': csvs['scans'].count,
                'metadata_time_basis': 'Application associations and project/application tags are current at export, not historical',
+               'tls_verification': tls_mode(client.verify),
                'runtime_assessment': 'Not performed; npm/pypi presence does not identify deployed runtimes',
                'limitations': ['Not a production deployment inventory', 'No new scans or vulnerability recalculation are triggered',
                                'No matches does not establish absence of exposure', 'Missing vulnerability section is unknown coverage']}
