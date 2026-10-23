@@ -18,11 +18,13 @@ every package, every reported vulnerability, and which project, application and 
 ## Contents
 
 - [Quick start](#quick-start)
+- [Common tasks](#common-tasks)
 - [Configuration](#configuration)
 - [SSL errors on a company network](#ssl-errors-on-a-company-network)
 - [Usage](#usage)
   - [Choose scan types (SCA, Container Security)](#choose-scan-types)
   - [Choose projects (including a CSV of project IDs)](#choose-projects)
+  - [All options](#all-options)
 - [Output files](#output-files)
 - [Reading the results](#reading-the-results)
 - [Security notes](#security-notes)
@@ -30,23 +32,53 @@ every package, every reported vulnerability, and which project, application and 
 
 ## Quick start
 
-```powershell
-python -m pip install -r requirements.txt
-Copy-Item config.example.ini config.ini
-notepad config.ini          # set base_url, token_url and api_key
-python checkmarx_exposure.py --project "Product A" --out pilot
-```
+1. Install the one dependency and create your local config:
 
-Check `pilot\coverage.csv` and `pilot\findings.csv`, then run against everything:
+   ```powershell
+   python -m pip install -r requirements.txt
+   Copy-Item config.example.ini config.ini
+   notepad config.ini          # set base_url, token_url and api_key
+   ```
 
-```powershell
-python checkmarx_exposure.py --out all-products              # latest scan per branch
-python checkmarx_exposure.py --dump-all --out full-dump      # every retained scan
-python checkmarx_exposure.py --scan-types sca,containers --out with-containers
-python checkmarx_exposure.py --project-ids-file my-projects.csv --scan-types sca,containers --out selected
-```
+   On a company network that inspects HTTPS, also set `verify_ssl = false` in
+   `config.ini` (see [SSL errors](#ssl-errors-on-a-company-network)).
+
+2. Try one project first:
+
+   ```powershell
+   python checkmarx_exposure.py --project "Product A" --out pilot
+   ```
+
+3. Open `pilot\coverage.csv` (did every branch export?) and `pilot\findings.csv` (the
+   vulnerabilities). Then pick a command from [Common tasks](#common-tasks).
 
 Each `--out` folder must be new, so results from different runs never mix.
+
+## Common tasks
+
+| I want... | Command |
+| --- | --- |
+| SCA for every project (latest scan per branch) | `python checkmarx_exposure.py --out all-sca` |
+| SCA and Container Security for every project | `python checkmarx_exposure.py --scan-types sca,containers --out all` |
+| Container Security only | `python checkmarx_exposure.py --scan-types containers --out containers` |
+| Only the projects in my CSV of project IDs, SCA and containers | `python checkmarx_exposure.py --project-ids-file my-projects.csv --scan-types sca,containers --out selected` |
+| One or two specific projects by ID | `python checkmarx_exposure.py --project-id ID1,ID2 --out two-projects` |
+| One application's projects | `python checkmarx_exposure.py --application "Mobile Banking" --out mobile` |
+| Projects with a tag | `python checkmarx_exposure.py --tag team=payments --out payments` |
+| npm packages only (in `matches.csv`) | `python checkmarx_exposure.py --ecosystems npm --out npm-review` |
+| Where a package is used (in `matches.csv`) | `python checkmarx_exposure.py --package lodash --out lodash` |
+| Where a CVE is reported (in `matches.csv`) | `python checkmarx_exposure.py --cve CVE-YYYY-NNNNN --out cve-review` |
+| Only the `main` branch | `python checkmarx_exposure.py --branch main --out main-only` |
+| Every retained scan, not just the latest | `python checkmarx_exposure.py --dump-all --scan-types sca,containers --out full-dump` |
+| One run with SSL checks off | add `--insecure` to any command |
+
+Options combine: for example `--project-ids-file my-projects.csv --scan-types
+sca,containers --ecosystems npm --insecure --out selected` exports SCA and containers
+for the listed projects, puts npm SCA findings in `matches.csv`, and skips SSL checks.
+
+A project ID file is a CSV with one ID per row; see
+[`project-ids.example.csv`](project-ids.example.csv) and
+[A CSV of project IDs](#a-csv-of-project-ids).
 
 ## Configuration
 
@@ -227,6 +259,16 @@ project_id,note
 5f6a7b8c-0000-0000-0000-000000000000,Web shop
 ```
 
+A file with just the IDs works too:
+
+```csv
+1b2c3d4e-0000-0000-0000-000000000000
+5f6a7b8c-0000-0000-0000-000000000000
+```
+
+[`project-ids.example.csv`](project-ids.example.csv) is a template to copy. Save the
+file as CSV (Excel's "CSV UTF-8" is fine).
+
 IDs that are not exported (mistyped, deleted, not visible to the API identity, or
 excluded by another filter) are listed in a `WARNING:` line and under `metadata_errors`
 in `run.json`, and the run exits with code 2. Find project IDs in `projects.csv` or in
@@ -254,17 +296,38 @@ python checkmarx_exposure.py --package lodash --ecosystems npm --out lodash-revi
 python checkmarx_exposure.py --cve CVE-YYYY-NNNNN --out cve-review
 ```
 
-### Other options
+### All options
+
+Every option in one place. Run `python checkmarx_exposure.py --help` for the same list.
 
 | Option | Default | Meaning |
 | --- | --- | --- |
-| `--branch NAME` | every branch | Only this exact branch (latest mode only). No branch is assumed to be production. |
-| `--raw-scan-report` | off (on with `--dump-all`) | Also save Checkmarx's original SCA scan report JSON |
-| `--stale-days N` | 30 | Scans older than this are marked `stale_or_unknown_date` |
-| `--export-timeout SECONDS` | 600 | Time allowed for Checkmarx to produce each report |
-| `--product-map FILE.csv` | project name | Map projects to business products (see below) |
+| **Output and settings** | | |
+| `--out DIR` | `checkmarx-output` | New folder for this run's files; must not exist yet |
 | `--config FILE` | `config.ini` beside the script | Settings file |
-| `--insecure` | off | Turn SSL checks off for this run |
+| `--insecure` | off | Turn SSL checks off for this run (same as `verify_ssl = false`) |
+| **What to export** | | |
+| `--scan-types TYPES` | `sca` | `sca`, `containers` (or `container-security`), or both comma-separated |
+| `--dump-all` | off | Every retained scan instead of the latest per branch; implies `--raw-scan-report` |
+| `--branch NAME` | every branch | Only this exact branch (latest mode only). No branch is assumed to be production. |
+| `--raw-scan-report` | off | Also save Checkmarx's original SCA scan report JSON |
+| **Which projects** ([details](#choose-projects)) | | |
+| `--project-id ID[,ID...]` | all | Exact project IDs; repeatable |
+| `--project-ids-file FILE.csv` | all | Project IDs from a CSV file |
+| `--project TEXT` | all | Project names containing this text |
+| `--tag KEY[=VALUE]` | all | Project tag; repeatable |
+| `--application NAME_OR_ID` | all | Application name or ID; repeatable |
+| `--group GROUP` | all | Project group; repeatable |
+| **Which findings go in the matches files** ([details](#choose-findings)) | | |
+| `--ecosystems LIST` | all | Package types such as `npm,pypi` (SCA only) |
+| `--package TEXT` | all | Package names containing this text |
+| `--cve ID` | all | Exact vulnerability ID or alias |
+| **Tuning** | | |
+| `--stale-days N` | 30 | Scans older than this are marked `stale_or_unknown_date` |
+| `--export-timeout SECONDS` | 600 | Time allowed for Checkmarx to produce each SCA report |
+| `--product-map FILE.csv` | project name | Map projects to business products (see below) |
+
+`--dump-all` cannot be combined with `--branch`, `--ecosystems`, `--package` or `--cve`.
 
 ### Map projects to products
 
