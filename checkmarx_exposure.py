@@ -8,6 +8,7 @@ import csv
 import json
 import os
 import re
+import ssl
 import sys
 import time
 import warnings
@@ -60,12 +61,40 @@ def https_url(value):
     return value.rstrip('/')
 
 
-def session():
+def relaxed_tls_context():
+    """No certificate/hostname checks and tolerant handshakes, for TLS-inspecting proxies."""
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    ctx.options |= getattr(ssl, 'OP_LEGACY_SERVER_CONNECT', 0x4)  # Older proxies.
+    with contextlib.suppress(ValueError, ssl.SSLError):
+        ctx.minimum_version = ssl.TLSVersion.TLSv1
+    with contextlib.suppress(ssl.SSLError):
+        ctx.set_ciphers('DEFAULT:@SECLEVEL=0')
+    return ctx
+
+
+class RelaxedTLSAdapter(HTTPAdapter):
+    def __init__(self, **kwargs):
+        self.ssl_context = relaxed_tls_context()
+        super().__init__(**kwargs)
+
+    def init_poolmanager(self, *args, **kwargs):
+        kwargs['ssl_context'] = self.ssl_context
+        return super().init_poolmanager(*args, **kwargs)
+
+    def proxy_manager_for(self, proxy, **kwargs):
+        kwargs['ssl_context'] = self.ssl_context
+        return super().proxy_manager_for(proxy, **kwargs)
+
+
+def session(verify=True):
     s = requests.Session()
     # POSTs are deliberately not retried here: they can create duplicate export jobs.
-    s.mount('https://', HTTPAdapter(max_retries=Retry(
-        total=4, backoff_factor=1, status_forcelist=[429, 502, 503, 504],
-        allowed_methods=['GET'], respect_retry_after_header=True)))
+    retry = Retry(total=4, backoff_factor=1, status_forcelist=[429, 502, 503, 504],
+                  allowed_methods=['GET'], respect_retry_after_header=True)
+    s.mount('https://', RelaxedTLSAdapter(max_retries=retry) if verify is False
+            else HTTPAdapter(max_retries=retry))
     return s
 
 
@@ -147,15 +176,15 @@ class Client:
         self.verify = False if insecure else settings['verify_ssl']
         if self.verify is False:
             warnings.simplefilter('ignore', InsecureRequestWarning)
-            print('WARNING: TLS certificate verification is disabled; the API key and results '
+            print('WARNING: SSL checks are disabled (verify_ssl = false); the API key and results '
                   'are exposed to anyone able to intercept this network traffic.', file=sys.stderr)
         self.base = https_url(settings['base_url'])
         self.token_url = https_url(settings['token_url'])
         self.api_key = settings['api_key']
         self.client_id = settings['client_id']
         self.secret = settings['client_secret']
-        self.http = session()
-        self.download = session()  # Never receives a Checkmarx Authorization header.
+        self.http = session(self.verify)
+        self.download = session(self.verify)  # Never receives a Checkmarx Authorization header.
         self.token = ''
         self.expires = 0
 

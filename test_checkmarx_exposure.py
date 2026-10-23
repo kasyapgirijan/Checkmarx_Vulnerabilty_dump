@@ -236,6 +236,14 @@ class Tests(unittest.TestCase):
         self.assertIs(client.http.post.call_args.kwargs['verify'], False)
         self.assertIs(client.http.request.call_args.kwargs['verify'], False)
 
+    def test_relaxed_tls_session(self):
+        adapter = cx.session(False).get_adapter('https://eu.ast.checkmarx.net')
+        self.assertIsInstance(adapter, cx.RelaxedTLSAdapter)
+        ctx = adapter.poolmanager.connection_pool_kw['ssl_context']
+        self.assertEqual((ctx.check_hostname, ctx.verify_mode), (False, cx.ssl.CERT_NONE))
+        self.assertTrue(ctx.options & getattr(cx.ssl, 'OP_LEGACY_SERVER_CONNECT', 0x4))
+        self.assertNotIsInstance(cx.session(True).get_adapter('https://x.example'), cx.RelaxedTLSAdapter)
+
     def test_connection_errors_are_diagnosable_but_redacted(self):
         exc = cx.requests.exceptions.SSLError(
             "HTTPSConnectionPool(host='eu.ast.checkmarx.net', port=443): Max retries exceeded with url: "

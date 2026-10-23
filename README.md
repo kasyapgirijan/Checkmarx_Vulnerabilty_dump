@@ -172,22 +172,29 @@ verify_ssl = C:\Secure\corporate-root-ca.pem
 
 in `config.ini` (or CX_VERIFY_SSL). Configure HTTPS_PROXY if a proxy is required.
 
-If you accept the risk on a trusted network, verification can be disabled with
-`verify_ssl = false` in `config.ini`, `CX_VERIFY_SSL=false`, or `--insecure` for a
-single run. A warning is printed and `run.json` records `tls_verification:
-disabled`. Without verification, anyone able to intercept the traffic can capture
-your API key and the exported vulnerability data, so rotate the key if the
-network later turns out to be untrusted.
+**Simplest option on a trusted PC: turn SSL checks off.** Add this one line under
+`[checkmarx]` in your local `config.ini`:
+
+```ini
+verify_ssl = false
+```
+
+(or set it once for your Windows user with `setx CX_VERIFY_SSL false` and open a new
+terminal, or pass `--insecure` for a single run). This skips certificate and
+hostname checks and also accepts older TLS handshakes used by some corporate
+proxies. A warning is printed and `run.json` records `tls_verification: disabled`.
+Anyone able to intercept the traffic could capture your API key and exported data,
+so rotate the key if the network later turns out to be untrusted. The setting only
+affects machines whose config/environment sets it; the default stays verified.
 
 If an SSL error persists with `verify_ssl = false`:
 - No `WARNING: TLS certificate verification is disabled` line at startup means the
   setting was not applied: check you are running this version of the script, that
   the line is under `[checkmarx]` in the config actually used, and that
   CX_VERIFY_SSL is not set to another value (environment values win).
-- Errors print the underlying reason (paths and secrets redacted). Reasons other than
-  `CERTIFICATE_VERIFY_FAILED`, such as `UNSAFE_LEGACY_RENEGOTIATION_DISABLED`,
-  `WRONG_VERSION_NUMBER` or a `ProxyError`, are handshake or proxy problems that
-  disabling verification cannot fix; check HTTPS_PROXY/NO_PROXY with your network team.
+- Errors print the underlying reason (paths and secrets redacted). `WRONG_VERSION_NUMBER`
+  or a `ProxyError` usually means a wrong HTTPS_PROXY value (for example `https://`
+  where the proxy expects `http://`); check HTTPS_PROXY/NO_PROXY with your network team.
 
 ## Run
 
