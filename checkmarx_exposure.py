@@ -731,8 +731,11 @@ def parse_args(argv=None):
     p.add_argument('--raw-csv', action='store_true',
                    help="Write values exactly as returned. By default, cells starting with = + - @ get a leading ' "
                         'so Excel cannot run them as formulas (this also changes scoped npm names like @scope/pkg)')
-    p.add_argument('--db', type=Path, metavar='POSTGRES.ini',
-                   help='Also load findings into PostgreSQL incrementally (see postgres.example.ini)')
+    p.add_argument('--db', nargs='?', const='', metavar='POSTGRES.ini',
+                   help='Also load findings into PostgreSQL incrementally. Alone, it reads the [postgres] section '
+                        'of the --config file; or give a separate INI (see postgres.example.ini)')
+    p.add_argument('--full', action='store_true',
+                   help='With --db: reload the newest completed scan of every branch even if already loaded')
     p.add_argument('--no-files', action='store_true',
                    help='With --db: do not keep the CSV and raw files, only load the database')
     p.add_argument('--no-progress', action='store_true', help='Do not show the progress bar on stderr')
@@ -756,14 +759,16 @@ def parse_args(argv=None):
         if any([args.branch, args.ecosystems, args.package, args.cve]):
             p.error('--dump-all cannot be combined with --branch or finding filters')
         args.raw_scan_report = True
-    if args.db and args.dump_all:
+    if args.db is not None and args.dump_all:
         p.error('--db cannot be combined with --dump-all; the database keeps history across runs instead')
-    if args.no_files and not args.db:
+    if args.full and args.db is None:
+        p.error('--full needs --db')
+    if args.no_files and args.db is None:
         p.error('--no-files needs --db, otherwise nothing would be saved')
     if args.no_files and args.out:
         p.error('--no-files cannot be combined with --out')
     if args.out is None:
-        args.out = ('checkmarx-output/' + datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ') if args.db
+        args.out = ('checkmarx-output/' + datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ') if args.db is not None
                     else 'checkmarx-output')
     if args.stale_days < 0 or args.export_timeout <= 0:
         p.error('stale-days must be >= 0 and export-timeout > 0')
@@ -1045,17 +1050,26 @@ def main(argv=None):
     product_map = load_product_map(args.product_map)
     with contextlib.ExitStack() as outer:
         store = None
-        if args.db:
+        if args.db is not None:
             if checkmarx_db is None:
                 raise ExportError('--db needs checkmarx_db.py next to this script')
-            store = checkmarx_db.Store.connect(args.db)
+            # Like Jira_extract, the [postgres] section can live in the main config file.
+            db_config = args.db or args.config or DEFAULT_CONFIG
+            store = checkmarx_db.Store.connect(
+                db_config, full=args.full,
+                status=lambda text: None if args.no_progress else print(text, file=sys.stderr, flush=True))
             outer.callback(store.close)
         if args.no_files:
             # Files are still produced (they are the export's working set) but removed at the end.
             out = Path(outer.enter_context(tempfile.TemporaryDirectory(prefix='checkmarx-'))) / 'run'
         else:
             out = Path(args.out)
-        return export_run(args, client, product_map, out, store)
+        try:
+            return export_run(args, client, product_map, out, store)
+        except BaseException as exc:
+            if store:  # Like jira_sync_state: the run is marked FAILED with the reason.
+                store.fail_run(safe_error(exc) if isinstance(exc, Exception) else type(exc).__name__)
+            raise
 
 
 def export_run(args, client, product_map, out, store=None):

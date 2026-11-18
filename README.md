@@ -313,7 +313,8 @@ Every option in one place. Run `python checkmarx_exposure.py --help` for the sam
 | `--insecure` | off | Turn SSL checks off for this run (same as `verify_ssl = false`) |
 | `--raw-csv` | off | Write CSV values exactly as returned, without the Excel formula guard (see Security notes) |
 | `--no-progress` | off | Hide the progress bar and status lines on stderr |
-| `--db FILE.ini` | off | Also load findings into PostgreSQL incrementally (see [below](#load-into-postgresql-incremental)) |
+| `--db [FILE.ini]` | off | Also load findings into PostgreSQL incrementally (see [below](#load-into-postgresql-incremental)). Alone, it reads `[postgres]` from the `--config` file |
+| `--full` | off | With `--db`: reload the newest completed scan of every branch, even if already loaded |
 | `--no-files` | off | With `--db`: load only the database, without keeping CSV and raw files |
 | **What to export** | | |
 | `--scan-types TYPES` | `sca` | `sca`, `containers` (or `container-security`), or both comma-separated |
@@ -365,23 +366,37 @@ REPLACE_WITH_PROJECT_UUID,Product A
 
 ## Load into PostgreSQL (incremental)
 
-Add `--db postgres.ini` to load findings into PostgreSQL as well. Each run loads only scans
+Add `--db` to load findings into PostgreSQL as well. Each run loads only scans
 that are new since the last run, and keeps track of when every finding was first seen,
 fixed, or reopened.
 
 ```powershell
 python -m pip install -r requirements-db.txt      # psycopg 3
-Copy-Item postgres.example.ini postgres.ini
-notepad postgres.ini                              # host, dbname, user; see below for the password
-python checkmarx_exposure.py --db postgres.ini --scan-types sca,containers
+notepad config.ini                                # add a [postgres] section (below)
+python checkmarx_exposure.py --db --scan-types sca,containers
 ```
 
-`postgres.ini` holds the connection settings (`host`, `port`, `dbname`, `user`,
-`password`, `sslmode`, `sslrootcert`, `connect_timeout`) and the `schema` to use
-(default `checkmarx`). Leave `password` empty to use the `PGPASSWORD` environment variable
-or a pgpass file instead of writing it in the file. Like `config.ini`, `postgres.ini` is
-ignored by Git. The user needs rights to create the schema on the first run, and to read
-and write its tables after that.
+The connection settings go in a `[postgres]` section, the same layout as the Jira
+extract project. Put it in your existing `config.ini` and use `--db` alone, or keep it
+in a separate file and pass `--db postgres.ini` (copy `postgres.example.ini`):
+
+```ini
+[postgres]
+host = localhost
+port = 5432
+database = checkmarx
+user = checkmarx_loader
+password =
+sslmode = prefer
+schema = checkmarx
+```
+
+Also accepted: `dbname` (instead of `database`), `sslrootcert` and `connect_timeout`.
+Tables are created in `schema` (default `checkmarx`). Leave `password` empty to use the
+`PGPASSWORD` environment variable or a pgpass file instead of writing it in the file.
+Both `config.ini` and `postgres.ini` are ignored by Git. The database and user must
+exist; the user needs rights to create the schema on the first run, and to read and write
+its tables after that.
 
 **How a run works**
 
@@ -401,6 +416,15 @@ and write its tables after that.
   under `checkmarx-output` unless you pass `--out`. Add `--no-files` to load only the
   database.
 - `--db` cannot be combined with `--dump-all`; the database builds the history instead.
+- `--full` reloads the newest completed scan of every branch even if it is already
+  loaded. Use it once after an upgrade that adds columns, to fill them for existing rows.
+- Each scan is committed on its own. If a run stops partway, scans already loaded stay,
+  and the next run carries on from there. The run is recorded in `runs` with
+  `status = FAILED` and the reason in `error`.
+- Only one load per schema runs at a time (a PostgreSQL advisory lock); a second run
+  stops with `Another Checkmarx load ... is already running`.
+- Schema changes are applied automatically on each run (`ADD COLUMN IF NOT EXISTS`), and
+  the views are recreated, so upgrading the script needs no manual SQL.
 
 **Finding identity.** SCA findings are keyed on vulnerability, ecosystem and package
 name, not the version, so moving to another version that is still vulnerable keeps the
@@ -414,25 +438,25 @@ the next build does not look like a fix.
 | --- | --- |
 | `findings` | One row per finding per project, branch and scan type: `status` (`open`/`fixed`), `first_seen_at`, `last_seen_at`, `fixed_at`, the scan IDs for each, `reopened_count`, `severity`, `triage_state`, package or image details, and the full row in `details` |
 | `finding_events` | History: `new`, `fixed` and `reopened`, with the scan and its date |
-| `open_findings` (view) | Open findings with project name, product and applications |
+| `vw_open_findings` (view) | Open findings with project name, product and applications. Point Power BI here |
 | `packages` | Package inventory per project and branch, vulnerable or not: `ecosystem`, `package`, `version`, `dependency_type`, `introduced_by`, `status` (`present`/`removed`), first and last seen, and when it was removed. Keyed with the version, so an upgrade shows the old version as removed and the new one as present |
-| `current_packages` (view) | Packages present now, with project name, product and applications |
+| `vw_current_packages` (view) | Packages present now, with project name, product and applications |
 | `projects`, `scans` | Latest project metadata and every scan seen |
 | `scan_loads` | Which scan was loaded for which scan type, and whether it could close findings |
 | `branch_state` | The last scan loaded per project, branch and scan type |
-| `runs` | One row per run, with the `run.json` summary and database counts |
+| `runs` | One row per run: `status` (`RUNNING`, `SUCCESS` or `FAILED`), `error`, the `run.json` summary and database counts |
 
 ```sql
 -- Open critical/high findings, oldest first
 SELECT project, branch, engine, vulnerability, package, versions, image_name, triage_state, first_seen_at
-FROM checkmarx.open_findings WHERE severity IN ('critical', 'high') ORDER BY first_seen_at;
+FROM checkmarx.vw_open_findings WHERE severity IN ('critical', 'high') ORDER BY first_seen_at;
 
 -- Which projects use Java libraries (Maven or Gradle)
-SELECT DISTINCT project, branch FROM checkmarx.current_packages WHERE ecosystem = 'maven';
+SELECT DISTINCT project, branch FROM checkmarx.vw_current_packages WHERE ecosystem = 'maven';
 
 -- Every log4j-core version in use, and whether it is a direct dependency
 SELECT project, branch, version, dependency_type, introduced_by
-FROM checkmarx.current_packages WHERE package = 'org.apache.logging.log4j/log4j-core' ORDER BY version;
+FROM checkmarx.vw_current_packages WHERE package = 'org.apache.logging.log4j/log4j-core' ORDER BY version;
 
 -- Fixed in the last 30 days, with time to fix
 SELECT project_id, branch, vulnerability, package, fixed_at, fixed_at - first_seen_at AS time_to_fix
@@ -578,7 +602,7 @@ outside the API identity's permissions, cannot be exported.
   them as formulas. This also changes scoped npm names (`@scope/pkg` becomes
   `'@scope/pkg`). If the CSVs feed a script, database or Power BI rather than Excel, use
   `--raw-csv` to keep values unchanged. The `purl` column and raw JSON are never changed.
-- `postgres.ini` may hold a database password; prefer `PGPASSWORD` or a pgpass file, and
+- `config.ini` or `postgres.ini` may hold a database password; prefer `PGPASSWORD` or a pgpass file, and
   use `sslmode = verify-full` for a database on another machine. Database errors are
   shown without the password.
 - Treat all output as internal security information.

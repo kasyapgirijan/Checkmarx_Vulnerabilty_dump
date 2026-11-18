@@ -98,8 +98,10 @@ CREATE TABLE IF NOT EXISTS findings (
     updated_at timestamptz NOT NULL,
     PRIMARY KEY (project_id, branch, engine, finding_key)
 );
-CREATE INDEX IF NOT EXISTS findings_status_idx ON findings (status);
-CREATE INDEX IF NOT EXISTS findings_vulnerability_idx ON findings (vulnerability);
+ALTER INDEX IF EXISTS findings_status_idx RENAME TO idx_findings_status;
+CREATE INDEX IF NOT EXISTS idx_findings_status ON findings (status);
+ALTER INDEX IF EXISTS findings_vulnerability_idx RENAME TO idx_findings_vulnerability;
+CREATE INDEX IF NOT EXISTS idx_findings_vulnerability ON findings (vulnerability);
 CREATE TABLE IF NOT EXISTS finding_events (
     event_id bigserial PRIMARY KEY,
     project_id text NOT NULL,
@@ -111,7 +113,8 @@ CREATE TABLE IF NOT EXISTS finding_events (
     occurred_at timestamptz,
     run_id bigint
 );
-CREATE INDEX IF NOT EXISTS finding_events_finding_idx ON finding_events (project_id, branch, engine, finding_key);
+ALTER INDEX IF EXISTS finding_events_finding_idx RENAME TO idx_finding_events_finding;
+CREATE INDEX IF NOT EXISTS idx_finding_events_finding ON finding_events (project_id, branch, engine, finding_key);
 CREATE TABLE IF NOT EXISTS packages (
     project_id text NOT NULL,
     branch text NOT NULL,
@@ -133,19 +136,41 @@ CREATE TABLE IF NOT EXISTS packages (
     updated_at timestamptz NOT NULL,
     PRIMARY KEY (project_id, branch, package_key)
 );
-CREATE INDEX IF NOT EXISTS packages_name_idx ON packages (ecosystem, package);
-CREATE OR REPLACE VIEW current_packages AS
-    SELECT p.name AS project, p.product, p.applications, k.*
-    FROM packages k LEFT JOIN projects p USING (project_id)
-    WHERE k.status = 'present';
-CREATE OR REPLACE VIEW open_findings AS
-    SELECT p.name AS project, p.product, p.applications, f.*
-    FROM findings f LEFT JOIN projects p USING (project_id)
-    WHERE f.status = 'open';
+ALTER INDEX IF EXISTS packages_name_idx RENAME TO idx_packages_package;
+CREATE INDEX IF NOT EXISTS idx_packages_package ON packages (ecosystem, package);
 """
 
 PACKAGE_COLUMNS = ['ecosystem', 'package', 'version', 'purl', 'scope', 'dependency_type', 'introduced_by']
 DEPENDENCY_RANK = {'direct': 2, 'transitive': 1}
+
+# Columns added after the first release: ADD COLUMN IF NOT EXISTS upgrades existing databases in place.
+MIGRATIONS_SQL = """
+ALTER TABLE runs ADD COLUMN IF NOT EXISTS status text;
+ALTER TABLE runs ADD COLUMN IF NOT EXISTS error text;
+CREATE INDEX IF NOT EXISTS idx_findings_severity ON findings (severity);
+CREATE INDEX IF NOT EXISTS idx_findings_project ON findings (project_id);
+CREATE INDEX IF NOT EXISTS idx_packages_project ON packages (project_id);
+"""
+
+# Views are dropped and recreated on every run: CREATE OR REPLACE VIEW fails once a table
+# under a view gains a column. The vw_ names are what Power BI or other reports should use.
+VIEWS_SQL = """
+DROP VIEW IF EXISTS open_findings;
+DROP VIEW IF EXISTS current_packages;
+DROP VIEW IF EXISTS vw_open_findings;
+DROP VIEW IF EXISTS vw_current_packages;
+CREATE VIEW vw_open_findings AS
+    SELECT p.name AS project, p.product, p.applications, f.*
+    FROM findings f LEFT JOIN projects p USING (project_id)
+    WHERE f.status = 'open';
+CREATE VIEW vw_current_packages AS
+    SELECT p.name AS project, p.product, p.applications, k.*
+    FROM packages k LEFT JOIN projects p USING (project_id)
+    WHERE k.status = 'present';
+"""
+
+# Session-level advisory lock so two loads into the same schema never interleave.
+LOCK_SQL = "SELECT pg_try_advisory_lock(hashtext('checkmarx_exposure:' || %s))"
 
 FINDING_COLUMNS = ['vulnerability', 'aliases', 'package', 'versions', 'ecosystem', 'purl', 'image_name',
                    'image_tags', 'severity', 'cvss_score', 'triage_state', 'result_status', 'recommendation',
@@ -170,13 +195,17 @@ def load_db_settings(path):
         # Parser errors can quote whole lines, including the password.
         raise DatabaseError('Cannot read PostgreSQL config: check file permissions and INI syntax') from None
     if not parser.has_section('postgres'):
-        raise DatabaseError('PostgreSQL config must contain a [postgres] section')
-    section = parser['postgres']
+        raise DatabaseError(f'{path.name} has no [postgres] section; add one (see postgres.example.ini)')
+    section = dict(parser['postgres'])
+    if 'database' in section:  # The key name Jira_extract uses; libpq calls it dbname.
+        if section.get('dbname', '').strip():
+            raise DatabaseError('Set either database or dbname in [postgres], not both')
+        section['dbname'] = section.pop('database')
     unknown = sorted(set(section) - set(SETTING_KEYS) - {'schema'})
     if unknown:
         raise DatabaseError('Unknown PostgreSQL setting(s): ' + ', '.join(unknown))
     settings = {k: section[k].strip() for k in SETTING_KEYS if section.get(k, '').strip()}
-    if settings.get('password', '').startswith('YOUR_'):
+    if settings.get('password', '').startswith(('YOUR_', 'CHANGE_ME')):
         raise DatabaseError('Replace the password placeholder in your PostgreSQL config, or leave it empty')
     return settings, section.get('schema', '').strip() or DEFAULT_SCHEMA
 
@@ -276,26 +305,37 @@ def package_inventory(rows):
 
 
 class Store:
-    def __init__(self, conn, schema):
-        self.conn, self.schema = conn, schema
+    def __init__(self, conn, schema, full=False):
+        self.conn, self.schema, self.full = conn, schema, full
         self.run_id = None
         self.counts = {'scans_loaded': 0, 'new': 0, 'fixed': 0, 'reopened': 0,
                        'packages_added': 0, 'packages_removed': 0}
 
     @classmethod
-    def connect(cls, config_path):
+    def connect(cls, config_path, full=False, status=None):
         settings, schema = load_db_settings(config_path)
+        status = status or (lambda text: None)
         try:
             import psycopg
         except ImportError:
             raise DatabaseError('PostgreSQL loading needs psycopg: pip install -r requirements-db.txt') from None
         settings.setdefault('connect_timeout', '15')
+        status('Connecting to PostgreSQL...')
         try:
             conn = psycopg.connect(**settings, application_name='checkmarx_exposure')
         except psycopg.Error as exc:
             raise DatabaseError(describe(exc)) from None
-        store = cls(conn, schema)
-        store.migrate()
+        store = cls(conn, schema, full)
+        try:
+            with store.transaction() as cur:
+                cur.execute(LOCK_SQL, (schema,))
+                if not cur.fetchone()[0]:
+                    raise DatabaseError(f'Another Checkmarx load into schema {schema} is already running')
+            status('Initializing database schema and views...')
+            store.migrate()
+        except BaseException:
+            conn.close()
+            raise
         return store
 
     def migrate(self):
@@ -304,6 +344,8 @@ class Store:
             cur.execute(sql.SQL('CREATE SCHEMA IF NOT EXISTS {}').format(sql.Identifier(self.schema)))
             cur.execute(sql.SQL('SET search_path TO {}').format(sql.Identifier(self.schema)))
             cur.execute(SCHEMA_SQL)
+            cur.execute(MIGRATIONS_SQL)
+            cur.execute(VIEWS_SQL)
         # search_path set inside a committed transaction stays for the session.
 
     def transaction(self):
@@ -314,15 +356,31 @@ class Store:
 
     def start_run(self, now):
         with self.transaction() as cur:
-            cur.execute('INSERT INTO runs (started_at) VALUES (%s) RETURNING run_id', (now,))
+            cur.execute("INSERT INTO runs (started_at, status) VALUES (%s, 'RUNNING') RETURNING run_id", (now,))
             self.run_id = cur.fetchone()[0]
 
     def finish_run(self, summary):
         summary = {**summary, 'database': dict(self.counts)}
         with self.transaction() as cur:
-            cur.execute('UPDATE runs SET finished_at = now(), summary = %s::jsonb WHERE run_id = %s',
-                        (jsonb(summary), self.run_id))
+            cur.execute("UPDATE runs SET finished_at = now(), status = 'SUCCESS', error = NULL, summary = %s::jsonb "
+                        "WHERE run_id = %s", (jsonb(summary), self.run_id))
         return summary['database']
+
+    def fail_run(self, error):
+        """Record a failed run (best effort: the database itself may be what failed).
+
+        Scans committed before the failure stay loaded; the next run continues after them.
+        """
+        if self.run_id is None:
+            return
+        try:
+            self.conn.rollback()
+            with self.transaction() as cur:
+                cur.execute("UPDATE runs SET finished_at = now(), status = 'FAILED', error = %s, "
+                            "summary = %s::jsonb WHERE run_id = %s",
+                            (str(error)[:5000], jsonb({'database': self.counts}), self.run_id))
+        except Exception:  # noqa: BLE001 - never hide the original error
+            pass
 
     def save_project(self, project, context):
         with self.transaction() as cur:
@@ -370,6 +428,8 @@ class Store:
         """
         if not completed:
             return []
+        if self.full:  # --full: reload the newest completed scan even if it is already loaded.
+            return [completed[0]]
         last = state.get((branch, engine))
         if last is None:
             return [completed[0]]
