@@ -13,3 +13,4 @@ checkmarx-full-dump/
 # Local credentials; publish only the placeholder template
 *.ini
 !config.example.ini
+!postgres.example.ini

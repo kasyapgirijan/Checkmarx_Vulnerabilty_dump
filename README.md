@@ -23,6 +23,7 @@ every package, every reported vulnerability, and which project, application and 
 - [Usage](#usage)
   - [Choose scan types (SCA, Container Security)](#choose-scan-types)
   - [Choose projects (including a CSV of project IDs)](#choose-projects)
+- [Load into PostgreSQL (incremental)](#load-into-postgresql-incremental)
 - [Output files](#output-files)
 - [Reading the results](#reading-the-results)
 - [Security notes](#security-notes)
@@ -267,6 +268,8 @@ python checkmarx_exposure.py --cve CVE-YYYY-NNNNN --out cve-review
 | `--insecure` | off | Turn SSL checks off for this run |
 | `--raw-csv` | off | Write CSV values exactly as returned, without the Excel formula guard (see Security notes) |
 | `--no-progress` | off | Hide the progress bar and status lines on stderr |
+| `--db FILE.ini` | off | Also load findings into PostgreSQL incrementally (see [below](#load-into-postgresql-incremental)) |
+| `--no-files` | off | With `--db`: load only the database, without keeping CSV and raw files |
 
 ### Progress
 
@@ -292,6 +295,77 @@ project IDs (from `projects.csv`) and pass `--product-map products.csv`:
 project_id,product
 REPLACE_WITH_PROJECT_UUID,Product A
 ```
+
+## Load into PostgreSQL (incremental)
+
+Add `--db postgres.ini` to load findings into PostgreSQL as well. Each run loads only scans
+that are new since the last run, and keeps track of when every finding was first seen,
+fixed, or reopened.
+
+```powershell
+python -m pip install -r requirements-db.txt      # psycopg 3
+Copy-Item postgres.example.ini postgres.ini
+notepad postgres.ini                              # host, dbname, user; see below for the password
+python checkmarx_exposure.py --db postgres.ini --scan-types sca,containers
+```
+
+`postgres.ini` holds the connection settings (`host`, `port`, `dbname`, `user`,
+`password`, `sslmode`, `sslrootcert`, `connect_timeout`) and the `schema` to use
+(default `checkmarx`). Leave `password` empty to use the `PGPASSWORD` environment variable
+or a pgpass file instead of writing it in the file. Like `config.ini`, `postgres.ini` is
+ignored by Git. The user needs rights to create the schema on the first run, and to read
+and write its tables after that.
+
+**How a run works**
+
+- For each project, branch and scan type, the first run loads the newest completed scan
+  as the baseline. Later runs load every completed scan newer than the last one loaded,
+  oldest first, so a fix is dated by the scan that first showed it.
+- Scans that are already loaded are not exported again (`coverage.csv` status
+  `already_loaded`). A scan whose export failed is not recorded, so the next run tries
+  it again.
+- A finding is **fixed** when a newer completed scan of the same project, branch and scan
+  type no longer contains it. It is **reopened** if it comes back later.
+- Findings are never closed by a scan whose engine did not complete, or whose report had no
+  vulnerability section, because a missing result there says nothing about a fix.
+- Checkmarx triage (for example `not_affected` from SCA, or `NOT_EXPLOITABLE` for
+  containers) is kept in `triage_state`. It does not close a finding.
+- CSV and raw files are still written. A run with `--db` gets a new timestamped folder
+  under `checkmarx-output` unless you pass `--out`. Add `--no-files` to load only the
+  database.
+- `--db` cannot be combined with `--dump-all`; the database builds the history instead.
+
+**Finding identity.** SCA findings are keyed on vulnerability, ecosystem and package
+name, not the version, so moving to another version that is still vulnerable keeps the
+same finding (the versions are in `versions`). Container findings are keyed on
+vulnerability, image name (not the tag), image file and package, so a new image tag from
+the next build does not look like a fix.
+
+**Tables** (in the configured schema):
+
+| Table | Contents |
+| --- | --- |
+| `findings` | One row per finding per project, branch and scan type: `status` (`open`/`fixed`), `first_seen_at`, `last_seen_at`, `fixed_at`, the scan IDs for each, `reopened_count`, `severity`, `triage_state`, package or image details, and the full row in `details` |
+| `finding_events` | History: `new`, `fixed` and `reopened`, with the scan and its date |
+| `open_findings` (view) | Open findings with project name, product and applications |
+| `projects`, `scans` | Latest project metadata and every scan seen |
+| `scan_loads` | Which scan was loaded for which scan type, and whether it could close findings |
+| `branch_state` | The last scan loaded per project, branch and scan type |
+| `runs` | One row per run, with the `run.json` summary and database counts |
+
+```sql
+-- Open critical/high findings, oldest first
+SELECT project, branch, engine, vulnerability, package, versions, image_name, triage_state, first_seen_at
+FROM checkmarx.open_findings WHERE severity IN ('critical', 'high') ORDER BY first_seen_at;
+
+-- Fixed in the last 30 days, with time to fix
+SELECT project_id, branch, vulnerability, package, fixed_at, fixed_at - first_seen_at AS time_to_fix
+FROM checkmarx.findings WHERE status = 'fixed' AND fixed_at > now() - interval '30 days';
+```
+
+`first_seen_at` is the date of the first scan this tool loaded that contained the
+finding (Container Security's own `firstFoundAt` when it is earlier). For findings that
+already existed before your first `--db` run, it is the baseline scan's date.
 
 ## Output files
 
@@ -370,6 +444,7 @@ time**, not at scan time.
 | `export_error` | Report generation or download failed; see `error` |
 | `scan_list_error` | The project's scans could not be listed |
 | `no_scans_in_scope` | No scans (on `--branch`, if given) |
+| `already_loaded` | `--db` only: this scan is already in the database, so it was not exported again |
 
 - `scan_type`: `sca` or `containers`.
 - `newer_scan_than_selected = True`: a newer scan exists than the one exported (it may
@@ -412,20 +487,29 @@ outside the API identity's permissions, cannot be exported.
   them as formulas. This also changes scoped npm names (`@scope/pkg` becomes
   `'@scope/pkg`). If the CSVs feed a script, database or Power BI rather than Excel, use
   `--raw-csv` to keep values unchanged. The `purl` column and raw JSON are never changed.
+- `postgres.ini` may hold a database password; prefer `PGPASSWORD` or a pgpass file, and
+  use `sslmode = verify-full` for a database on another machine. Database errors are
+  shown without the password.
 - Treat all output as internal security information.
 
 ## Development
 
 ```powershell
-python -m unittest -v test_checkmarx_exposure.py
+python -m unittest -v test_checkmarx_exposure.py test_checkmarx_db.py
 ```
+
+The PostgreSQL tests are skipped unless `CX_TEST_PG` points at a disposable database,
+for example `CX_TEST_PG="host=localhost port=5432 user=postgres dbname=postgres"`. Each
+test creates its own schema and drops it afterwards.
 
 The tests use mocked API responses and sample CycloneDX data: pagination, per-branch
 fallback when SCA failed, container results and their paging, scan-type selection,
 project ID lists and CSV files, finding and project filters, unlinked references, missing
 vulnerability data, export polling (including temporary 400/404 replies and 429 rate limits), short
 result pages, missing-scan coverage gaps, progress output, downloads
-and redirects, UTF-8 BOM handling, SSL settings, config handling and secret redaction.
+and redirects, UTF-8 BOM handling, SSL settings, config handling and secret redaction,
+and incremental PostgreSQL loading (baseline, new, fixed, reopened, failed scans,
+missing vulnerability sections, retries after export errors, containers).
 They have not been run against a live tenant.
 
 API behaviour is based on the Checkmarx documentation and the official Checkmarx CLI:
