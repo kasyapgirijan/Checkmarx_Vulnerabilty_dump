@@ -72,6 +72,14 @@ class UnitTests(unittest.TestCase):
         self.assertEqual(db.normalize([container], 'containers')['CVE-2|nginx|Dockerfile|zlib']['triage_state'],
                          'NOT_EXPLOITABLE')
 
+    def test_package_inventory_merges_duplicates(self):
+        rows = [{'ecosystem': 'npm', 'package': 'a', 'version': '1', 'dependency_type': 'transitive',
+                 'introduced_by': 'b@1', 'scope': 'required'},
+                {'ecosystem': 'npm', 'package': 'a', 'version': '1', 'dependency_type': 'direct', 'scope': 'optional'}]
+        record = db.package_inventory(rows)['npm|a|1']
+        self.assertEqual((record['dependency_type'], record['introduced_by'], record['scope']),
+                         ('direct', '', 'optional; required'))
+
     def test_pending_scans(self):
         store = db.Store(None, 'x')
         completed = cx.newest_first([scan('s1', 1), scan('s2', 2), scan('s3', 3)])
@@ -174,6 +182,36 @@ class PostgresTests(unittest.TestCase):
         self.assertEqual(fixed_at, datetime(2026, 10, 5, tzinfo=timezone.utc))
         open_rows = self.conn.execute(f'SELECT project, finding_key FROM {self.schema}.open_findings').fetchall()
         self.assertEqual(open_rows, [('Project', pypi)])
+
+    def test_package_inventory(self):
+        def sbom(log4j_version):
+            return {'bomFormat': 'CycloneDX', 'metadata': {'component': {'bom-ref': 'app'}},
+                    'components': [{'bom-ref': 'spring', 'group': 'org.springframework', 'name': 'spring-core',
+                                    'version': '6.0', 'purl': 'pkg:maven/org.springframework/spring-core@6.0'},
+                                   {'bom-ref': 'log4j', 'group': 'org.apache.logging.log4j', 'name': 'log4j-core',
+                                    'version': log4j_version,
+                                    'purl': f'pkg:maven/org.apache.logging.log4j/log4j-core@{log4j_version}'}],
+                    'dependencies': [{'ref': 'app', 'dependsOn': ['spring']}, {'ref': 'spring', 'dependsOn': ['log4j']}],
+                    'vulnerabilities': []}
+        self.scans = [scan('s1', 1)]
+        self.boms = {'s1': sbom('2.14.1')}
+        self.run_export()
+        self.scans.append(scan('s2', 2))
+        self.boms['s2'] = sbom('2.17.1')  # Upgraded: the old version is removed, the new one present.
+        code, _ = self.run_export()
+        self.assertEqual(code, 0)
+        rows = self.conn.execute(
+            f'SELECT package, version, dependency_type, introduced_by, status, first_seen_scan_id, removed_in_scan_id '
+            f'FROM {self.schema}.packages ORDER BY package, version').fetchall()
+        self.assertEqual(rows, [
+            ('org.apache.logging.log4j/log4j-core', '2.14.1', 'transitive', 'org.springframework/spring-core@6.0',
+             'removed', 's1', 's2'),
+            ('org.apache.logging.log4j/log4j-core', '2.17.1', 'transitive', 'org.springframework/spring-core@6.0',
+             'present', 's2', None),
+            ('org.springframework/spring-core', '6.0', 'direct', '', 'present', 's1', None)])
+        java = self.conn.execute(f"SELECT DISTINCT project FROM {self.schema}.current_packages "
+                                 f"WHERE ecosystem = 'maven'").fetchall()
+        self.assertEqual(java, [('Project',)])
 
     def test_missing_vulnerability_section_never_closes(self):
         self.scans = [scan('s1', 1)]

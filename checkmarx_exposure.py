@@ -425,6 +425,54 @@ def components(items):
         yield from components(c.get('components') or [])
 
 
+INTRODUCED_BY_LIMIT = 5  # Direct dependencies named per transitive package; the rest are counted.
+
+
+def dependency_graph(bom, by_ref):
+    """{component ref: (dependency_type, introduced_by)} from the CycloneDX dependencies section.
+
+    Roots are the SBOM's own component (metadata.component) and any graph node that is not a
+    package, such as a manifest or project node. Packages a root depends on are direct; every
+    other package that something depends on is transitive, and introduced_by names the direct
+    dependencies it is reached through. A package nothing depends on is treated as direct.
+    Without a dependencies section every package is unknown.
+    """
+    edges = bom.get('dependencies')
+    if not isinstance(edges, list) or not edges:
+        return {}
+    children, parents = {}, {}
+    for edge in edges:
+        if not isinstance(edge, dict) or not edge.get('ref'):
+            continue
+        for child in edge.get('dependsOn') or []:
+            children.setdefault(edge['ref'], set()).add(child)
+            parents.setdefault(child, set()).add(edge['ref'])
+    root = ((bom.get('metadata') or {}).get('component') or {}).get('bom-ref')
+    roots = {r for r in children if r not in by_ref} | ({root} if root else set())
+    direct = {ref for ref in by_ref if ref not in parents or parents[ref] & roots}
+    result = {}
+    for ref in by_ref:
+        if ref in direct:
+            result[ref] = ('direct', '')
+            continue
+        # Walk up the graph to the direct dependencies this package is reached through.
+        seen, stack, via = {ref}, list(parents.get(ref, ())), set()
+        while stack:
+            node = stack.pop()
+            if node in seen:
+                continue
+            seen.add(node)
+            if node in direct:
+                via.add(node)
+            elif node not in roots:
+                stack.extend(parents.get(node, ()))
+        names = sorted({by_ref[r]['package'] + ('@' + by_ref[r]['version'] if by_ref[r]['version'] else '')
+                        for r in via})
+        extra = len(names) - INTRODUCED_BY_LIMIT
+        result[ref] = ('transitive', '; '.join(names[:INTRODUCED_BY_LIMIT]) + (f'; +{extra} more' if extra > 0 else ''))
+    return result
+
+
 def flatten(bom, context):
     if bom.get('bomFormat') != 'CycloneDX' or not isinstance(bom.get('components'), list):
         raise ExportError('Unexpected SBOM schema: expected CycloneDX components array')
@@ -440,6 +488,9 @@ def flatten(bom, context):
         packages.append(row)
         if ref:
             by_ref[ref] = row
+    graph = dependency_graph(bom, by_ref)
+    for row in packages:
+        row['dependency_type'], row['introduced_by'] = graph.get(row['component_ref'], ('unknown', ''))
     vulnerabilities = bom.get('vulnerabilities', [])
     if not isinstance(vulnerabilities, list):
         raise ExportError('Unexpected vulnerabilities schema')
@@ -496,7 +547,7 @@ def container_findings(results, context):
 
 META = ['application_ids_json', 'application_names_json', 'application_tags_json', 'application_mapping_status', 'project_tags_json', 'scan_tags_json']
 BASE = META + ['product', 'product_mapping', 'project', 'applications', 'project_id', 'branch', 'scan_id', 'scan_date', 'scan_age_days']
-PKG = BASE + ['component_ref', 'package', 'version', 'ecosystem', 'purl', 'scope', 'component_type', 'runtime_verified']
+PKG = BASE + ['component_ref', 'package', 'version', 'ecosystem', 'purl', 'scope', 'component_type', 'dependency_type', 'introduced_by', 'runtime_verified']
 FIND = PKG + ['vulnerability', 'aliases', 'severity', 'ratings_json', 'analysis_state', 'recommendation', 'affected_versions_json', 'source_url', 'package_link_status']
 CONTAINER = BASE + ['result_id', 'similarity_id', 'image_name', 'image_tag', 'image_file_path', 'image_origin', 'package', 'version', 'package_identifier', 'vulnerability', 'aliases', 'cwe', 'cvss_score', 'severity', 'state', 'status', 'first_found_at', 'found_at', 'recommended_version', 'description', 'runtime_verified']
 COVER = BASE + ['scan_type', 'scan_role', 'status', 'latest_scan_id', 'latest_scan_status', 'newer_scan_than_selected', 'vulnerability_section', 'package_count', 'finding_count', 'unresolved_links', 'runtime_verified', 'error']
@@ -822,6 +873,10 @@ class Exporter:
         self.matches = finding_filter(args)
         # --ecosystems describes purl ecosystems, which container results do not carry.
         self.container_matches = finding_filter(argparse.Namespace(ecosystems='', package=args.package, cve=args.cve))
+        # package_matches.csv: the inventory filtered by --ecosystems and --package (a CVE does not apply).
+        self.package_matches = (finding_filter(argparse.Namespace(ecosystems=args.ecosystems, package=args.package,
+                                                                  cve=None))
+                                if args.ecosystems or args.package else None)
         self.coverage, self.project_rows = [], []
 
     def run_project(self, project, product_map, apps):
@@ -934,9 +989,11 @@ class Exporter:
             self.csv['packages'].write(pkgs)
             self.csv['findings'].write(vulns)
             self.csv['matches'].write(r for r in vulns if self.matches(r))
+            if self.package_matches:
+                self.csv['package_matches'].write(r for r in pkgs if self.package_matches(r))
             c.update(status=fresh, vulnerability_section=section, package_count=len(pkgs), finding_count=len(vulns),
                      unresolved_links=unresolved)
-            loaded = (vulns, section)
+            loaded = (vulns, section, pkgs)
         except (ExportError, *RECOVERABLE) as exc:
             errors.append('CycloneDxJson: ' + safe_error(exc))
         if self.args.raw_scan_report:
@@ -1042,7 +1099,7 @@ def export_run(args, client, product_map, out, store=None):
     with contextlib.ExitStack() as stack:
         csvs = {}
         for name, fields in [('application_projects', LINK_FIELDS), ('scans', SCAN_FIELDS),
-                             ('packages', PKG), ('findings', FIND), ('matches', FIND),
+                             ('packages', PKG), ('package_matches', PKG), ('findings', FIND), ('matches', FIND),
                              ('container_findings', CONTAINER), ('container_matches', CONTAINER)]:
             csvs[name] = CsvWriter(out / f'{name}.csv', fields, escape=not args.raw_csv)
             stack.callback(csvs[name].close)

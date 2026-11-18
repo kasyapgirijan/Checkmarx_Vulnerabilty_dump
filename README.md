@@ -68,6 +68,8 @@ Each `--out` folder must be new, so results from different runs never mix.
 | Projects with a tag | `python checkmarx_exposure.py --tag team=payments --out payments` |
 | npm packages only (in `matches.csv`) | `python checkmarx_exposure.py --ecosystems npm --out npm-review` |
 | Where a package is used (in `matches.csv`) | `python checkmarx_exposure.py --package lodash --out lodash` |
+| Which projects use Java (Maven/Gradle) libraries (in `package_matches.csv`) | `python checkmarx_exposure.py --ecosystems maven --out java-inventory` |
+| Which versions of a package are in use, vulnerable or not (in `package_matches.csv`) | `python checkmarx_exposure.py --package log4j-core --out log4j-versions` |
 | Where a CVE is reported (in `matches.csv`) | `python checkmarx_exposure.py --cve CVE-YYYY-NNNNN --out cve-review` |
 | Only the `main` branch | `python checkmarx_exposure.py --branch main --out main-only` |
 | Every retained scan, not just the latest | `python checkmarx_exposure.py --dump-all --scan-types sca,containers --out full-dump` |
@@ -277,8 +279,10 @@ the project's page in Checkmarx One.
 
 ### Choose findings
 
-These narrow `matches.csv` and `container_matches.csv` only; the other files always
-keep everything. They cannot be combined with `--dump-all` (filter the findings files in
+These narrow `matches.csv`, `container_matches.csv` and `package_matches.csv` only; the
+other files always keep everything. `package_matches.csv` is the package inventory
+(vulnerable or not) filtered by `--ecosystems` and `--package`; it is only filled when
+one of those is given. They cannot be combined with `--dump-all` (filter the findings files in
 Excel or Power BI instead).
 
 | Option | Matches |
@@ -411,6 +415,8 @@ the next build does not look like a fix.
 | `findings` | One row per finding per project, branch and scan type: `status` (`open`/`fixed`), `first_seen_at`, `last_seen_at`, `fixed_at`, the scan IDs for each, `reopened_count`, `severity`, `triage_state`, package or image details, and the full row in `details` |
 | `finding_events` | History: `new`, `fixed` and `reopened`, with the scan and its date |
 | `open_findings` (view) | Open findings with project name, product and applications |
+| `packages` | Package inventory per project and branch, vulnerable or not: `ecosystem`, `package`, `version`, `dependency_type`, `introduced_by`, `status` (`present`/`removed`), first and last seen, and when it was removed. Keyed with the version, so an upgrade shows the old version as removed and the new one as present |
+| `current_packages` (view) | Packages present now, with project name, product and applications |
 | `projects`, `scans` | Latest project metadata and every scan seen |
 | `scan_loads` | Which scan was loaded for which scan type, and whether it could close findings |
 | `branch_state` | The last scan loaded per project, branch and scan type |
@@ -421,10 +427,21 @@ the next build does not look like a fix.
 SELECT project, branch, engine, vulnerability, package, versions, image_name, triage_state, first_seen_at
 FROM checkmarx.open_findings WHERE severity IN ('critical', 'high') ORDER BY first_seen_at;
 
+-- Which projects use Java libraries (Maven or Gradle)
+SELECT DISTINCT project, branch FROM checkmarx.current_packages WHERE ecosystem = 'maven';
+
+-- Every log4j-core version in use, and whether it is a direct dependency
+SELECT project, branch, version, dependency_type, introduced_by
+FROM checkmarx.current_packages WHERE package = 'org.apache.logging.log4j/log4j-core' ORDER BY version;
+
 -- Fixed in the last 30 days, with time to fix
 SELECT project_id, branch, vulnerability, package, fixed_at, fixed_at - first_seen_at AS time_to_fix
 FROM checkmarx.findings WHERE status = 'fixed' AND fixed_at > now() - interval '30 days';
 ```
+
+The package inventory comes from SCA (Container Security only reports packages with
+findings, so image packages are not part of it). SCA reads build files and lockfiles: it
+lists the libraries a project uses, not the Java, Node.js or Python runtime it runs on.
 
 `first_seen_at` is the date of the first scan this tool loaded that contained the
 finding (Container Security's own `firstFoundAt` when it is earlier). For findings that
@@ -434,7 +451,8 @@ already existed before your first `--db` run, it is the baseline scan's date.
 
 | File | Contents |
 | --- | --- |
-| `packages.csv` | Every package in every exported scan, vulnerable or not |
+| `packages.csv` | Every package in every exported scan, vulnerable or not, with `dependency_type` (`direct`/`transitive`/`unknown`) and `introduced_by` |
+| `package_matches.csv` | The `packages.csv` rows that match `--ecosystems` and `--package` (empty without them) |
 | `findings.csv` | Every vulnerability/package pair, with severity and triage state |
 | `matches.csv` | The `findings.csv` rows that match `--ecosystems`, `--package` and `--cve` |
 | `container_findings.csv` | Every Container Security finding: image, package, vulnerability, severity, state (`--scan-types containers`) |
@@ -463,6 +481,16 @@ Rows in `packages`, `findings`, `matches`, `container_findings`, `container_matc
 - `application_mapping_status`: `resolved`, `unassigned`, or `partial_or_unknown` when
   applications could not be fully read
 - `project_tags_json`, `scan_tags_json`: tags as JSON, keeping empty values
+
+### Direct and transitive dependencies
+
+`packages.csv`, `findings.csv` and `matches.csv` have a `dependency_type` column, read
+from the dependency graph in the CycloneDX report:
+
+- `direct`: the project depends on it itself (or nothing else in the graph pulls it in)
+- `transitive`: pulled in by another package; `introduced_by` names the direct
+  dependencies it comes through (up to 5, then `+N more`)
+- `unknown`: the report had no dependency graph
 
 ### Container findings columns
 
