@@ -112,11 +112,40 @@ CREATE TABLE IF NOT EXISTS finding_events (
     run_id bigint
 );
 CREATE INDEX IF NOT EXISTS finding_events_finding_idx ON finding_events (project_id, branch, engine, finding_key);
+CREATE TABLE IF NOT EXISTS packages (
+    project_id text NOT NULL,
+    branch text NOT NULL,
+    package_key text NOT NULL,
+    ecosystem text,
+    package text,
+    version text,
+    purl text,
+    scope text,
+    dependency_type text,
+    introduced_by text,
+    status text NOT NULL CHECK (status IN ('present', 'removed')),
+    first_seen_at timestamptz,
+    first_seen_scan_id text,
+    last_seen_at timestamptz,
+    last_seen_scan_id text,
+    removed_at timestamptz,
+    removed_in_scan_id text,
+    updated_at timestamptz NOT NULL,
+    PRIMARY KEY (project_id, branch, package_key)
+);
+CREATE INDEX IF NOT EXISTS packages_name_idx ON packages (ecosystem, package);
+CREATE OR REPLACE VIEW current_packages AS
+    SELECT p.name AS project, p.product, p.applications, k.*
+    FROM packages k LEFT JOIN projects p USING (project_id)
+    WHERE k.status = 'present';
 CREATE OR REPLACE VIEW open_findings AS
     SELECT p.name AS project, p.product, p.applications, f.*
     FROM findings f LEFT JOIN projects p USING (project_id)
     WHERE f.status = 'open';
 """
+
+PACKAGE_COLUMNS = ['ecosystem', 'package', 'version', 'purl', 'scope', 'dependency_type', 'introduced_by']
+DEPENDENCY_RANK = {'direct': 2, 'transitive': 1}
 
 FINDING_COLUMNS = ['vulnerability', 'aliases', 'package', 'versions', 'ecosystem', 'purl', 'image_name',
                    'image_tags', 'severity', 'cvss_score', 'triage_state', 'result_status', 'recommendation',
@@ -223,11 +252,35 @@ def normalize(rows, engine):
     return records
 
 
+def package_inventory(rows):
+    """packages.csv rows of one scan -> {package_key: record}; the same package version listed
+    more than once (several manifests) is merged, and direct wins over transitive."""
+    records = {}
+    for row in rows:
+        name = row.get('package') or 'ref:' + str(row.get('component_ref') or '')
+        key = '|'.join(str(x or '') for x in (row.get('ecosystem'), name, row.get('version')))
+        record = records.setdefault(key, {'ecosystem': row.get('ecosystem', ''), 'package': row.get('package', ''),
+                                          'version': row.get('version', ''), 'purl': set(), 'scope': set(),
+                                          'dependency_type': 'unknown', 'introduced_by': set()})
+        record['purl'].add(row.get('purl'))
+        record['scope'].add(row.get('scope'))
+        kind = row.get('dependency_type') or 'unknown'
+        if DEPENDENCY_RANK.get(kind, 0) > DEPENDENCY_RANK.get(record['dependency_type'], 0):
+            record['dependency_type'] = kind
+        record['introduced_by'].update(x for x in str(row.get('introduced_by') or '').split('; ') if x)
+    for record in records.values():
+        record['purl'], record['scope'] = joined(record['purl']), joined(record['scope'])
+        record['introduced_by'] = ('' if record['dependency_type'] == 'direct'
+                                   else '; '.join(sorted(record['introduced_by'])))
+    return records
+
+
 class Store:
     def __init__(self, conn, schema):
         self.conn, self.schema = conn, schema
         self.run_id = None
-        self.counts = {'scans_loaded': 0, 'new': 0, 'fixed': 0, 'reopened': 0}
+        self.counts = {'scans_loaded': 0, 'new': 0, 'fixed': 0, 'reopened': 0,
+                       'packages_added': 0, 'packages_removed': 0}
 
     @classmethod
     def connect(cls, config_path):
@@ -327,11 +380,13 @@ class Store:
                  and (to_time(s.get('createdAt')) or last_created) > last_created]
         return list(reversed(newer))
 
-    def load_scan(self, project_id, branch, engine, scan, rows, section):
+    def load_scan(self, project_id, branch, engine, scan, rows, section, packages=None):
         """Apply one completed scan's findings in a single transaction.
 
         Findings are only closed when the scan carried a vulnerability section; otherwise the
-        absence of a finding says nothing about whether it was fixed.
+        absence of a finding says nothing about whether it was fixed. With packages (SCA), the
+        package inventory of the branch is replaced by this scan's: new versions are added and
+        packages no longer listed are marked removed.
         """
         closes = section == 'present'
         created = to_time(scan.get('createdAt')) or datetime.now(timezone.utc)
@@ -379,6 +434,8 @@ class Store:
                                                 occurred_at, run_id)
                     VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
                     """, [(*e, scan_id, created, self.run_id) for e in events])
+            if packages is not None:
+                self._load_packages(cur, where[:2], scan_id, created, package_inventory(packages))
             cur.execute("""
                 INSERT INTO scan_loads (scan_id, engine, project_id, branch, scan_created_at, vulnerability_section,
                                         finding_count, closed_findings, loaded_at, run_id)
@@ -400,6 +457,32 @@ class Store:
         self.counts['reopened'] += len(reopened)
         self.counts['fixed'] += len(fixed)
         return {'new': len(new), 'reopened': len(reopened), 'fixed': len(fixed)}
+
+
+    def _load_packages(self, cur, where, scan_id, created, records):
+        cur.execute('SELECT package_key, status FROM packages WHERE project_id = %s AND branch = %s FOR UPDATE',
+                    where)
+        existing = dict(cur.fetchall())
+        values = [(*where, key, *(rec[c] for c in PACKAGE_COLUMNS), created, scan_id, created, scan_id)
+                  for key, rec in records.items()]
+        if values:
+            cur.executemany(f"""
+                INSERT INTO packages (project_id, branch, package_key, {', '.join(PACKAGE_COLUMNS)}, status,
+                    first_seen_at, first_seen_scan_id, last_seen_at, last_seen_scan_id, updated_at)
+                VALUES ({', '.join(['%s'] * (3 + len(PACKAGE_COLUMNS)))}, 'present', %s, %s, %s, %s, now())
+                ON CONFLICT (project_id, branch, package_key) DO UPDATE SET
+                    {', '.join(f'{c} = EXCLUDED.{c}' for c in PACKAGE_COLUMNS)}, status = 'present',
+                    last_seen_at = EXCLUDED.last_seen_at, last_seen_scan_id = EXCLUDED.last_seen_scan_id,
+                    removed_at = NULL, removed_in_scan_id = NULL, updated_at = now()
+                """, values)
+        removed = [k for k, status in existing.items() if status == 'present' and k not in records]
+        if removed:
+            cur.executemany("""
+                UPDATE packages SET status = 'removed', removed_at = %s, removed_in_scan_id = %s, updated_at = now()
+                WHERE project_id = %s AND branch = %s AND package_key = %s
+                """, [(created, scan_id, *where, k) for k in removed])
+        self.counts['packages_added'] += sum(1 for k in records if existing.get(k) != 'present')
+        self.counts['packages_removed'] += len(removed)
 
 
 def describe(exc):

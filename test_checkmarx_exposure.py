@@ -346,6 +346,46 @@ class Tests(unittest.TestCase):
         quiet.finish()
         self.assertEqual(silent.getvalue(), '')
 
+    def test_direct_and_transitive_dependencies(self):
+        b = {'bomFormat': 'CycloneDX', 'metadata': {'component': {'bom-ref': 'app'}},
+             'components': [{'bom-ref': 'spring', 'group': 'org.springframework', 'name': 'spring-core', 'version': '6.0'},
+                            {'bom-ref': 'log4j', 'group': 'org.apache.logging.log4j', 'name': 'log4j-core', 'version': '2.14.1'},
+                            {'bom-ref': 'jcl', 'name': 'commons-logging', 'version': '1.2'},
+                            {'bom-ref': 'loose', 'name': 'orphan', 'version': '1'}],
+             'dependencies': [{'ref': 'app', 'dependsOn': ['spring', 'log4j']},
+                              {'ref': 'spring', 'dependsOn': ['jcl']}, {'ref': 'log4j', 'dependsOn': []}]}
+        rows = {r['component_ref']: (r['dependency_type'], r['introduced_by']) for r in cx.flatten(b, {})[0]}
+        self.assertEqual(rows, {'spring': ('direct', ''), 'log4j': ('direct', ''), 'loose': ('direct', ''),
+                                'jcl': ('transitive', 'org.springframework/spring-core@6.0')})
+        # Without metadata.component, a non-package node (a manifest) is the root.
+        b['dependencies'][0]['ref'] = 'pom.xml'
+        del b['metadata']
+        rows = {r['component_ref']: r['dependency_type'] for r in cx.flatten(b, {})[0]}
+        self.assertEqual(rows['jcl'], 'transitive')
+        self.assertEqual(rows['log4j'], 'direct')
+        del b['dependencies']
+        self.assertEqual({r['dependency_type'] for r in cx.flatten(b, {})[0]}, {'unknown'})
+        # Findings carry the package's dependency type.
+        self.assertEqual(cx.flatten(bom(), {})[1][0]['dependency_type'], 'unknown')
+
+    @patch('checkmarx_exposure.Client')
+    def test_package_matches_inventory(self, constructor):
+        import csv
+        client = constructor.return_value
+        client.verify = True
+        scans = [{'id': 's1', 'branch': 'main', 'createdAt': '2026-10-01T00:00:00Z',
+                  'statusDetails': [{'name': 'sca', 'status': 'Completed'}]}]
+        client.pages.side_effect = lambda path, key, **kw: iter(
+            {'projects': [{'id': 'p', 'name': 'P'}], 'applications': [], 'scans': scans}[key])
+        client.export.side_effect = lambda sid, fmt, timeout: cx.json.dumps(bom()).encode()
+        for extra, expected in (([], []), (['--ecosystems', 'python'], ['django'])):
+            with tempfile.TemporaryDirectory() as tmp:
+                out = Path(tmp) / 'out'
+                with patch('sys.stderr'), patch('sys.stdout'):
+                    cx.main(extra + ['--out', str(out)])
+                with (out / 'package_matches.csv').open(encoding='utf-8-sig') as f:
+                    self.assertEqual([r['package'] for r in csv.DictReader(f)], expected)
+
     def test_scan_types_and_project_ids_args(self):
         self.assertEqual(cx.parse_args([]).engines, ['sca'])
         self.assertEqual(cx.parse_args(['--scan-types', 'SCA,containers,container']).engines, ['sca', 'containers'])
