@@ -11,6 +11,7 @@ import re
 import shutil
 import ssl
 import sys
+import tempfile
 import time
 import warnings
 from datetime import datetime, timezone
@@ -21,6 +22,11 @@ import requests
 from requests.adapters import HTTPAdapter
 from urllib3.exceptions import InsecureRequestWarning
 from urllib3.util.retry import Retry
+
+try:  # Optional PostgreSQL store (--db); CSV-only use needs neither it nor psycopg.
+    import checkmarx_db
+except ImportError:
+    checkmarx_db = None
 
 DEFAULT_CONFIG = Path(__file__).resolve().with_name('config.ini')
 CONNECT_TIMEOUT, READ_TIMEOUT = 15, 120
@@ -48,7 +54,7 @@ class ExportError(Exception):
 
 def safe_error(exc):
     # requests exception text can contain signed URLs or tokens; never log/CSV it.
-    if isinstance(exc, ExportError):
+    if isinstance(exc, ExportError) or (checkmarx_db and isinstance(exc, checkmarx_db.DatabaseError)):
         return str(exc)
     if isinstance(exc, requests.ConnectionError):  # Includes SSLError and ProxyError.
         # Keep host and the underlying reason (needed to diagnose TLS/proxy problems),
@@ -645,7 +651,8 @@ def load_product_map(path):
 
 def parse_args(argv=None):
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument('--out', default='checkmarx-output')
+    p.add_argument('--out', help='Output folder (must not exist). Default checkmarx-output, or '
+                                 'checkmarx-output/<UTC time> with --db')
     p.add_argument('--config', type=Path, help='INI path; default config.ini beside this script. Non-empty CX_* environment variables override it')
     p.add_argument('--insecure', action='store_true',
                    help='Turn off all SSL checks for this run (same as verify_ssl = false)')
@@ -673,6 +680,10 @@ def parse_args(argv=None):
     p.add_argument('--raw-csv', action='store_true',
                    help="Write values exactly as returned. By default, cells starting with = + - @ get a leading ' "
                         'so Excel cannot run them as formulas (this also changes scoped npm names like @scope/pkg)')
+    p.add_argument('--db', type=Path, metavar='POSTGRES.ini',
+                   help='Also load findings into PostgreSQL incrementally (see postgres.example.ini)')
+    p.add_argument('--no-files', action='store_true',
+                   help='With --db: do not keep the CSV and raw files, only load the database')
     p.add_argument('--no-progress', action='store_true', help='Do not show the progress bar on stderr')
     p.add_argument('--dump-all', action='store_true',
                    help='All retained scans and their completed reports; project filters allowed, branch/finding filters not')
@@ -694,6 +705,15 @@ def parse_args(argv=None):
         if any([args.branch, args.ecosystems, args.package, args.cve]):
             p.error('--dump-all cannot be combined with --branch or finding filters')
         args.raw_scan_report = True
+    if args.db and args.dump_all:
+        p.error('--db cannot be combined with --dump-all; the database keeps history across runs instead')
+    if args.no_files and not args.db:
+        p.error('--no-files needs --db, otherwise nothing would be saved')
+    if args.no_files and args.out:
+        p.error('--no-files cannot be combined with --out')
+    if args.out is None:
+        args.out = ('checkmarx-output/' + datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ') if args.db
+                    else 'checkmarx-output')
     if args.stale_days < 0 or args.export_timeout <= 0:
         p.error('stale-days must be >= 0 and export-timeout > 0')
     return args
@@ -793,8 +813,9 @@ class Progress:
 
 
 class Exporter:
-    def __init__(self, client, args, out, csvs, progress=None):
+    def __init__(self, client, args, out, csvs, progress=None, store=None):
         self.client, self.args, self.out, self.csv = client, args, out, csvs
+        self.store = store
         self.progress = progress or Progress(0, enabled=False)
         self.raw = out / 'raw'
         self.now = datetime.now(timezone.utc)
@@ -817,12 +838,17 @@ class Exporter:
              'application_tags_json': encoded(apps.by_id.get(aid, {}).get('tags')),
              'project_tags_json': context['project_tags_json']}
             for aid in json.loads(context['application_ids_json']))
+        if self.store:
+            self.store.save_project(project, context)
         try:
             self.progress.step('listing scans')
             scans = self.fetch_scans(pid, context)
         except (ExportError, *RECOVERABLE) as exc:
             self.coverage.append({**context, 'status': 'scan_list_error', 'error': safe_error(exc)})
             return
+        if self.store:
+            self.store.save_scans(pid, scans)
+            return self.run_project_incremental(pid, context, scans)
         for engine in self.args.engines:
             current = {name: chosen['id'] for name, _, chosen in choose_scans(scans, engine=engine) if chosen}
             selections = (all_scan_selections(scans) if self.args.dump_all
@@ -843,6 +869,31 @@ class Exporter:
                     'scan_role': role, 'latest_scan_id': latest['id'], 'latest_scan_status': latest.get('status', ''),
                     'runtime_verified': 'not_assessed'}, latest, scan, engine))
 
+    def run_project_incremental(self, pid, context, scans):
+        """--db: per branch and engine, export only completed scans the database has not applied yet."""
+        state = self.store.branch_state(pid)
+        for engine in self.args.engines:
+            selections = choose_scans(scans, self.args.branch, engine)
+            if not selections:
+                self.coverage.append({**context, 'scan_type': engine, 'branch': self.args.branch or '',
+                                      'status': 'no_scans_in_scope'})
+            for branch, latest, chosen in selections:
+                completed = [s for s in newest_first(scans) if branch_of(s) == branch and engine_completed(s, engine)]
+                todo = self.store.pending(state, branch, engine, completed)
+                base = {**context, 'scan_type': engine, 'branch': branch, 'latest_scan_id': latest['id'],
+                        'latest_scan_status': latest.get('status', ''), 'runtime_verified': 'not_assessed'}
+                if not todo:
+                    # Nothing new: the chosen scan (if any) is already in the database.
+                    self.progress.step(f'{engine} branch {branch}: '
+                                       + ('already loaded' if chosen else 'no completed scan'))
+                    self.coverage.append(self.export_scan({**base, 'scan_role': 'current'}, latest, chosen,
+                                                          engine, skip=True))
+                    continue
+                for number, scan in enumerate(todo, 1):
+                    role = 'current' if scan['id'] == chosen['id'] else 'historical'
+                    self.progress.step(f'{engine} branch {branch}: new scan {number}/{len(todo)} {scan["id"]}')
+                    self.coverage.append(self.export_scan({**base, 'scan_role': role}, latest, scan, engine))
+
     def fetch_scans(self, pid, context):
         scans = []
         with (self.raw / f'scans-{quote(str(pid), safe="")}.jsonl').open('w', encoding='utf-8') as raw:
@@ -856,7 +907,7 @@ class Exporter:
                     'engines_json': encoded(record.get('engines'))}])
         return scans
 
-    def export_scan(self, c, latest, scan, engine='sca'):
+    def export_scan(self, c, latest, scan, engine='sca', skip=False):
         if not scan or not engine_completed(scan, engine):
             return {**c, 'scan_id': scan.get('id', '') if scan else '',
                     'scan_date': scan.get('createdAt', '') if scan else '',
@@ -868,10 +919,13 @@ class Exporter:
                  scan_age_days=round(age, 1) if age_valid else '',
                  newer_scan_than_selected=latest['id'] != scan['id'])
         fresh = 'exported' if age_valid and age <= self.args.stale_days else 'stale_or_unknown_date'
+        if skip:  # --db: this scan was applied by an earlier run.
+            c.update(status='already_loaded' if fresh == 'exported' else fresh, vulnerability_section='present')
+            return c
         if engine == 'containers':
             return self.export_containers(c, scan, fresh)
         stem = file_stem(scan['id'])
-        errors = []
+        errors, loaded = [], None
         try:
             content = self.client.export(scan['id'], 'CycloneDxJson', self.args.export_timeout)
             (self.raw / f'{stem}.cdx.json').write_bytes(content)  # Original evidence, unmodified.
@@ -882,6 +936,7 @@ class Exporter:
             self.csv['matches'].write(r for r in vulns if self.matches(r))
             c.update(status=fresh, vulnerability_section=section, package_count=len(pkgs), finding_count=len(vulns),
                      unresolved_links=unresolved)
+            loaded = (vulns, section)
         except (ExportError, *RECOVERABLE) as exc:
             errors.append('CycloneDxJson: ' + safe_error(exc))
         if self.args.raw_scan_report:
@@ -890,6 +945,9 @@ class Exporter:
                 (self.raw / f'{stem}.scan-report.json').write_bytes(content)
             except (ExportError, *RECOVERABLE) as exc:
                 errors.append('ScanReportJson: ' + safe_error(exc))
+        if loaded and self.store:
+            # Outside the try: a database failure stops the run instead of passing as an export error.
+            self.store.load_scan(c['project_id'], c['branch'], 'sca', scan, *loaded)
         if errors:
             c.update(status='export_error', error='; '.join(errors))
         return c
@@ -908,6 +966,9 @@ class Exporter:
                      unresolved_links=0)
         except (ExportError, *RECOVERABLE) as exc:
             c.update(status='export_error', error='Containers results: ' + safe_error(exc))
+            return c
+        if self.store:
+            self.store.load_scan(c['project_id'], c['branch'], 'containers', scan, rows, 'present')
         return c
 
 
@@ -917,7 +978,7 @@ def coverage_gap(row):
         return True
     if row.get('scan_role') == 'historical':
         return False  # Older scans in --dump-all are evidence, not current exposure.
-    return (row.get('status') != 'exported' or row.get('vulnerability_section') != 'present'
+    return (row.get('status') not in ('exported', 'already_loaded') or row.get('vulnerability_section') != 'present'
             or bool(row.get('unresolved_links')) or bool(row.get('newer_scan_than_selected')))
 
 
@@ -925,7 +986,22 @@ def main(argv=None):
     args = parse_args(argv)
     client = Client(args.config, insecure=args.insecure)
     product_map = load_product_map(args.product_map)
-    out = Path(args.out)
+    with contextlib.ExitStack() as outer:
+        store = None
+        if args.db:
+            if checkmarx_db is None:
+                raise ExportError('--db needs checkmarx_db.py next to this script')
+            store = checkmarx_db.Store.connect(args.db)
+            outer.callback(store.close)
+        if args.no_files:
+            # Files are still produced (they are the export's working set) but removed at the end.
+            out = Path(outer.enter_context(tempfile.TemporaryDirectory(prefix='checkmarx-'))) / 'run'
+        else:
+            out = Path(args.out)
+        return export_run(args, client, product_map, out, store)
+
+
+def export_run(args, client, product_map, out, store=None):
     out.mkdir(parents=True, exist_ok=False)  # Separate evidence per run; do not mix old/new exports.
     (out / 'raw').mkdir()
     def status(text):
@@ -973,7 +1049,9 @@ def main(argv=None):
         progress = Progress(len(projects), enabled=not args.no_progress)
         stack.callback(progress.close)  # Ends the bar's line even if the run stops with an error.
         client.on_wait = progress.wait
-        exporter = Exporter(client, args, out, csvs, progress)
+        if store:
+            store.start_run(datetime.now(timezone.utc))
+        exporter = Exporter(client, args, out, csvs, progress, store)
         for index, project in enumerate(projects, 1):
             progress.project(index, project['name'])
             exporter.run_project(project, product_map, apps)
@@ -997,18 +1075,28 @@ def main(argv=None):
                'runtime_assessment': 'Not performed; npm/pypi presence does not identify deployed runtimes',
                'limitations': ['Not a production deployment inventory', 'No new scans or vulnerability recalculation are triggered',
                                'No matches does not establish absence of exposure', 'Missing vulnerability section is unknown coverage']}
+    if store:
+        summary['database'] = store.finish_run(summary)
     (out / 'run.json').write_text(json.dumps(summary, indent=2), encoding='utf-8')
     incomplete = (bool(metadata_errors) or any(coverage_gap(r) for r in exporter.coverage)
                   or any(r['application_mapping_status'] == 'partial_or_unknown' for r in exporter.project_rows))
-    print(f'Saved {csvs["packages"].count} packages, {csvs["findings"].count} SCA finding rows, '
-          f'{csvs["container_findings"].count} container finding rows. '
-          f'Review coverage.csv. Output: {out.resolve()}')
+    if store:
+        db = summary['database']
+        print(f'Database: {db["scans_loaded"]} new scan load(s), {db["new"]} new, {db["fixed"]} fixed, '
+              f'{db["reopened"]} reopened finding(s).')
+    if args.no_files:
+        print('Files were not kept (--no-files).')
+    else:
+        print(f'Saved {csvs["packages"].count} packages, {csvs["findings"].count} SCA finding rows, '
+              f'{csvs["container_findings"].count} container finding rows. '
+              f'Review coverage.csv. Output: {out.resolve()}')
     return 2 if incomplete else 0
 
 
 if __name__ == '__main__':
     try:
         sys.exit(main())
-    except (ExportError, requests.RequestException, KeyError, ValueError, OSError) as exc:
+    except (ExportError, requests.RequestException, KeyError, ValueError, OSError,
+            *((checkmarx_db.DatabaseError,) if checkmarx_db else ())) as exc:
         print('ERROR: ' + safe_error(exc), file=sys.stderr)
         sys.exit(1)
