@@ -26,6 +26,7 @@ every package, every reported vulnerability, and which project, application and 
   - [Choose projects (including a CSV of project IDs)](#choose-projects)
   - [All options](#all-options)
 - [Load into PostgreSQL (incremental)](#load-into-postgresql-incremental)
+- [Exposure report (Log4Shell, Spring4Shell, React2Shell, ...)](#exposure-report)
 - [Output files](#output-files)
 - [Reading the results](#reading-the-results)
 - [Security notes](#security-notes)
@@ -471,6 +472,68 @@ lists the libraries a project uses, not the Java, Node.js or Python runtime it r
 finding (Container Security's own `firstFoundAt` when it is earlier). For findings that
 already existed before your first `--db` run, it is the baseline scan's date.
 
+## Exposure report
+
+`exposure_report.py` answers "where are we exposed to Log4Shell / Spring4Shell /
+React2Shell / ...?" as a CSV. It matches on **package name and version range**, not on
+Checkmarx's CVE list, so a vulnerable version is reported even when Checkmarx shows no
+CVE for it (`checkmarx_cves = NA`). Each vulnerability is a section in an INI file.
+
+```powershell
+Copy-Item report.example.ini report.ini
+notepad report.ini                         # source, output, and the vulnerabilities to look for
+python exposure_report.py --config report.ini
+python exposure_report.py --config report.ini --only Log4Shell --out log4shell.csv
+```
+
+**Where the data comes from** (`source` in `[report]`):
+
+- `db`: the PostgreSQL database that `checkmarx_exposure.py --db` fills (the current
+  package inventory and open findings). `db_config` names the file with the `[postgres]`
+  section, for example `config.ini`.
+- A folder written by `checkmarx_exposure.py` (latest mode, not `--dump-all`), for example
+  `source = checkmarx-output\20261118T101500Z`. No database needed.
+
+**A vulnerability section** (see `report.example.ini` for Log4Shell, Spring4Shell and
+React2Shell):
+
+```ini
+[Log4Shell]
+cves = CVE-2021-44228, CVE-2021-45046, CVE-2021-45105, CVE-2021-44832
+ecosystem = maven
+packages = org.apache.logging.log4j/log4j-core
+affected = >=2.0-beta9,<2.3.2 ; >=2.4,<2.12.4 ; >=2.13.0,<2.17.1
+fixed = 2.17.1 (Java 8+), 2.12.4 (Java 7), 2.3.2 (Java 6)
+```
+
+In `affected`, `,` means AND and `;` means OR; a bare version means exactly that
+version. `packages` takes names as they appear in `packages.csv` (Maven `group/artifact`)
+and `*` globs. Use `[Name/label]` sections to give one vulnerability several package
+rules, as React2Shell does for `react-server-dom-*` and `next`.
+
+**Output.** One row per project, branch, scan type (and image for containers), package
+and version that a rule matches, with the project, product and applications, the
+dependency type and what introduced it, and:
+
+| `verdict` | Meaning |
+| --- | --- |
+| `affected` | The version is inside an affected range |
+| `reported_by_checkmarx` | Checkmarx reports one of the `cves`, but no package rule matched (check the rule) |
+| `version_unknown` | The package matched but its version could not be read |
+| `not_affected` | The package is used, at a version outside the ranges |
+
+`checkmarx_reported_target_cve` says whether Checkmarx itself reports one of the `cves`
+on that package version (`no` with `affected` is the case this report exists for);
+`checkmarx_cves` lists every vulnerability Checkmarx reports there, or `NA`. A second file,
+`<output>-summary.csv`, has one row per vulnerability and project.
+
+Limits: version comparison handles npm/semver, Maven, PyPI and common OS package
+versions; check `version_unknown` rows by hand. Container Security only lists packages
+that have findings, so container rows appear only for packages with at least one finding,
+and they are matched by name only. Neither source shows the Java or Node.js runtime
+itself. The example ranges come from public advisories; check them against the vendor
+advisory before relying on the result.
+
 ## Output files
 
 | File | Contents |
@@ -610,7 +673,7 @@ outside the API identity's permissions, cannot be exported.
 ## Development
 
 ```powershell
-python -m unittest -v test_checkmarx_exposure.py test_checkmarx_db.py
+python -m unittest -v test_checkmarx_exposure.py test_checkmarx_db.py test_exposure_report.py
 ```
 
 The PostgreSQL tests are skipped unless `CX_TEST_PG` points at a disposable database,
