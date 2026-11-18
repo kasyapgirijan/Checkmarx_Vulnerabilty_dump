@@ -123,8 +123,8 @@ verify_ssl = false
 Or set it once for your Windows user (then open a new terminal):
 `setx CX_VERIFY_SSL false`. Or add `--insecure` to a single run.
 
-This skips certificate and hostname checks and also accepts the older handshakes some
-proxies use. The run starts with `WARNING: SSL checks are disabled ...`, and `run.json`
+This skips certificate and hostname checks and accepts the legacy renegotiation some
+proxies use. TLS 1.2 or newer and the default cipher list are still required. The run starts with `WARNING: SSL checks are disabled ...`, and `run.json`
 records `"tls_verification": "disabled"`. It only affects machines that set it; the
 default stays verified. Anyone able to intercept the traffic could read your API key
 and the results, so rotate the key if the network later turns out to be untrusted.
@@ -263,8 +263,24 @@ python checkmarx_exposure.py --cve CVE-YYYY-NNNNN --out cve-review
 | `--stale-days N` | 30 | Scans older than this are marked `stale_or_unknown_date` |
 | `--export-timeout SECONDS` | 600 | Time allowed for Checkmarx to produce each report |
 | `--product-map FILE.csv` | project name | Map projects to business products (see below) |
-| `--config FILE` | `config.ini` beside the script | Settings file |
+| `--config FILE` | `config.ini` beside the script | Settings file; non-empty `CX_*` environment variables override it |
 | `--insecure` | off | Turn SSL checks off for this run |
+| `--raw-csv` | off | Write CSV values exactly as returned, without the Excel formula guard (see Security notes) |
+| `--no-progress` | off | Hide the progress bar and status lines on stderr |
+
+### Progress
+
+While it runs, the script shows its progress on stderr, so stdout and the output files
+stay clean. In a terminal this is one updating line:
+
+```text
+[########----------------]  33% 4/12 projects | 2m10s | ~4m20s left | payments-api: waiting for CycloneDxJson report (15s)
+```
+
+It shows projects done, time elapsed, an estimate of the time left (from the average
+per project so far), and the project, scan and step running now. When stderr is
+redirected to a file or CI log, it prints one plain line per project and per scan
+instead. Use `--no-progress` to turn it off.
 
 ### Map projects to products
 
@@ -360,8 +376,12 @@ time**, not at scan time.
   have failed, still be running, or lack that engine). Worth a look.
 - For container rows, `package_count` is the number of distinct image/package/version
   combinations with findings (Checkmarx's results list holds only vulnerable packages).
-- `scan_role` (`--dump-all`): `current` for each branch's newest completed SCA scan,
-  `historical` for older ones.
+- `scan_role`: `current` for the evidence that represents each branch today: the
+  selected scan in latest mode, and in `--dump-all` each branch's newest scan whose
+  engine completed (or the newest scan, if none completed). Other scans are `historical`.
+- A branch with no completed scan for a requested scan type is `current` with
+  `no_confirmed_completed_*`, so it makes the run exit 2. With `--scan-types
+  sca,containers`, projects that never ran Container Security are flagged too.
 
 ### Exit codes
 
@@ -381,14 +401,17 @@ outside the API identity's permissions, cannot be exported.
   files except `config.example.ini` are ignored by Git. **Never commit a real config**:
   this repository is public.
 - Credentials are never written to output files or error messages. Error text has
-  request paths, query strings and proxy passwords removed.
+  request paths, query strings and proxy passwords removed. Local file errors (for
+  example an existing `--out` folder) show the reason and path.
 - Reports are downloaded from the authenticated
   `/api/sca/export/requests/{exportId}/download` endpoint on your `base_url`; container
   results are read from `/api/results` on the same host. If that
   redirects to another host (for example cloud storage), the API token is not sent there.
 - Report files are saved byte-for-byte as received.
 - CSV cells starting with `=`, `+`, `-` or `@` get a leading `'` so Excel does not run
-  them as formulas. The raw JSON keeps the original values.
+  them as formulas. This also changes scoped npm names (`@scope/pkg` becomes
+  `'@scope/pkg`). If the CSVs feed a script, database or Power BI rather than Excel, use
+  `--raw-csv` to keep values unchanged. The `purl` column and raw JSON are never changed.
 - Treat all output as internal security information.
 
 ## Development
@@ -400,7 +423,8 @@ python -m unittest -v test_checkmarx_exposure.py
 The tests use mocked API responses and sample CycloneDX data: pagination, per-branch
 fallback when SCA failed, container results and their paging, scan-type selection,
 project ID lists and CSV files, finding and project filters, unlinked references, missing
-vulnerability data, export polling (including temporary 400/404 replies), downloads
+vulnerability data, export polling (including temporary 400/404 replies and 429 rate limits), short
+result pages, missing-scan coverage gaps, progress output, downloads
 and redirects, UTF-8 BOM handling, SSL settings, config handling and secret redaction.
 They have not been run against a live tenant.
 

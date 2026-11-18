@@ -237,7 +237,7 @@ class Tests(unittest.TestCase):
             self.assertEqual(cx.main(['--scan-types', 'container-security', '--project-ids-file', str(ids),
                                       '--out', str(out)]), 2)  # Unknown ID and newer failed scan are flagged.
             client.export.assert_not_called()
-            client.results.assert_called_once_with('s1')
+            client.results.assert_called_once_with('s1', 'containers')
             with (out / 'container_findings.csv').open(encoding='utf-8-sig') as f:
                 rows = list(csv.DictReader(f))
             self.assertEqual([(r['project_id'], r['package']) for r in rows], [('P1', 'zlib')])
@@ -248,6 +248,103 @@ class Tests(unittest.TestCase):
             self.assertTrue((out / 'raw' / 's1.containers.json').exists())
             summary = cx.json.loads((out / 'run.json').read_text())
             self.assertEqual(summary['metadata_errors'][0]['project_ids'], ['missing'])
+
+    @patch('checkmarx_exposure.Client')
+    def test_branch_without_completed_scan_is_a_gap(self, constructor):
+        import csv
+        client = constructor.return_value
+        client.verify = True
+        scans = [{'id': 's1', 'branch': 'main', 'createdAt': '2026-10-01T00:00:00Z',
+                  'statusDetails': [{'name': 'sca', 'status': 'Failed'}]}]
+        client.pages.side_effect = lambda path, key, **kw: iter(
+            {'projects': [{'id': 'p', 'name': 'P'}], 'applications': [], 'scans': scans}[key])
+        for extra in ([], ['--dump-all']):
+            with tempfile.TemporaryDirectory() as tmp:
+                out = Path(tmp) / 'out'
+                with patch('sys.stderr'):
+                    self.assertEqual(cx.main(extra + ['--out', str(out), '--no-progress']), 2)
+                with (out / 'coverage.csv').open(encoding='utf-8-sig') as f:
+                    cover = list(csv.DictReader(f))
+                self.assertEqual([(r['scan_role'], r['status']) for r in cover],
+                                 [('current', 'no_confirmed_completed_sca')])
+        client.export.assert_not_called()
+
+    def test_results_short_read_is_an_error(self):
+        client = cx.Client.__new__(cx.Client)
+        with patch.object(cx, 'RESULTS_PAGE_SIZE', 2):
+            # The server capped the page at 1 result although 3 exist.
+            client.api = Mock(side_effect=[{'results': [{'id': 'a'}], 'totalCount': 3}])
+            with self.assertRaisesRegex(cx.ExportError, '1 of 3'):
+                client.results('s')
+            # No totalCount: keep paging until a short page instead of stopping after one.
+            client.api = Mock(side_effect=[{'results': [{'id': 'a', 'type': 'sast'}, {'id': 'b', 'type': 'containers'}]},
+                                           {'results': [{'id': 'c', 'type': 'Containers'}]}])
+            self.assertEqual([r['id'] for r in client.results('s', 'containers')], ['b', 'c'])
+
+    @patch('checkmarx_exposure.time.sleep')
+    def test_export_request_retries_rate_limit(self, sleep):
+        r = self.response
+        client = self.export_client([r(429, {}, {'Retry-After': '7'}), r(202, {'exportId': 'x'}),
+                                     r(200, {'exportStatus': 'Completed'}), r(200, b'{}')])
+        self.assertEqual(client.export('scan', 'CycloneDxJson', 60), b'{}')
+        sleep.assert_any_call(7.0)
+
+    def test_api_key_client_id_ignores_unrelated_config(self):
+        claims = cx.base64.urlsafe_b64encode(b'{"azp":"custom-app"}').decode().rstrip('=')
+        self.assertEqual(cx.token_client_id('h.' + claims + '.s', 'other-client'), 'custom-app')
+        self.assertEqual(cx.token_client_id('not-a-jwt', 'other-client'), 'other-client')
+
+    def test_raw_csv_keeps_scoped_package_names(self):
+        with tempfile.TemporaryDirectory() as d:
+            target = Path(d) / 'x.csv'
+            cx.write_csv(target, [{'package': '@scope/thing'}], ['package'], escape=False)
+            self.assertEqual(target.read_text(encoding='utf-8-sig').splitlines()[1], '@scope/thing')
+            cx.write_csv(target, [{'package': '@scope/thing'}], ['package'])
+            self.assertEqual(target.read_text(encoding='utf-8-sig').splitlines()[1], "'@scope/thing")
+        self.assertTrue(cx.parse_args(['--raw-csv']).raw_csv)
+
+    def test_product_map_short_rows(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / 'map.csv'
+            path.write_text('project_id,product\np1,Shop\np2\n,Orphan\n', encoding='utf-8')
+            self.assertEqual(cx.load_product_map(path), {'p1': 'Shop'})
+
+    def test_local_file_errors_keep_reason(self):
+        with tempfile.TemporaryDirectory() as d:
+            with self.assertRaises(FileExistsError) as result:
+                Path(d).mkdir()
+        text = cx.safe_error(result.exception)
+        self.assertIn('FileExistsError', text)
+        self.assertIn(d, text)
+
+    def test_progress_output(self):
+        import io
+        stream = io.StringIO()  # Not a terminal: plain lines, no control characters.
+        progress = cx.Progress(2, stream)
+        progress.project(1, 'Alpha')
+        progress.step('sca 1/1 branch main scan s1')
+        progress.wait('waiting for CycloneDxJson report (5s)')
+        progress.project(2, 'Beta')
+        progress.finish()
+        text = stream.getvalue()
+        self.assertIn('[1/2] Alpha', text)
+        self.assertIn('sca 1/1 branch main scan s1', text)
+        self.assertNotIn('waiting', text)
+        self.assertNotIn('\r', text)
+        self.assertIn('Finished 2 project(s)', text)
+        progress = cx.Progress(4, io.StringIO())
+        progress.project(2, 'Gamma')
+        progress.detail = 'waiting'
+        line = progress.render()
+        self.assertTrue(line.startswith('[######------------------]  25% 1/4 projects'))
+        self.assertIn('left | Gamma: waiting', line)
+        self.assertTrue(progress.render(width=20).endswith('...'))
+        self.assertEqual(len(progress.render(width=20)), 20)
+        silent = io.StringIO()
+        quiet = cx.Progress(1, silent, enabled=False)
+        quiet.project(1, 'X')
+        quiet.finish()
+        self.assertEqual(silent.getvalue(), '')
 
     def test_scan_types_and_project_ids_args(self):
         self.assertEqual(cx.parse_args([]).engines, ['sca'])
