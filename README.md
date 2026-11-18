@@ -25,6 +25,7 @@ every package, every reported vulnerability, and which project, application and 
   - [Choose scan types (SCA, Container Security)](#choose-scan-types)
   - [Choose projects (including a CSV of project IDs)](#choose-projects)
   - [All options](#all-options)
+- [Load into PostgreSQL (incremental)](#load-into-postgresql-incremental)
 - [Output files](#output-files)
 - [Reading the results](#reading-the-results)
 - [Security notes](#security-notes)
@@ -155,8 +156,8 @@ verify_ssl = false
 Or set it once for your Windows user (then open a new terminal):
 `setx CX_VERIFY_SSL false`. Or add `--insecure` to a single run.
 
-This skips certificate and hostname checks and also accepts the older handshakes some
-proxies use. The run starts with `WARNING: SSL checks are disabled ...`, and `run.json`
+This skips certificate and hostname checks and accepts the legacy renegotiation some
+proxies use. TLS 1.2 or newer and the default cipher list are still required. The run starts with `WARNING: SSL checks are disabled ...`, and `run.json`
 records `"tls_verification": "disabled"`. It only affects machines that set it; the
 default stays verified. Anyone able to intercept the traffic could read your API key
 and the results, so rotate the key if the network later turns out to be untrusted.
@@ -303,9 +304,13 @@ Every option in one place. Run `python checkmarx_exposure.py --help` for the sam
 | Option | Default | Meaning |
 | --- | --- | --- |
 | **Output and settings** | | |
-| `--out DIR` | `checkmarx-output` | New folder for this run's files; must not exist yet |
-| `--config FILE` | `config.ini` beside the script | Settings file |
+| `--out DIR` | `checkmarx-output` (timestamped subfolder with `--db`) | New folder for this run's files; must not exist yet |
+| `--config FILE` | `config.ini` beside the script | Settings file; non-empty `CX_*` environment variables override it |
 | `--insecure` | off | Turn SSL checks off for this run (same as `verify_ssl = false`) |
+| `--raw-csv` | off | Write CSV values exactly as returned, without the Excel formula guard (see Security notes) |
+| `--no-progress` | off | Hide the progress bar and status lines on stderr |
+| `--db FILE.ini` | off | Also load findings into PostgreSQL incrementally (see [below](#load-into-postgresql-incremental)) |
+| `--no-files` | off | With `--db`: load only the database, without keeping CSV and raw files |
 | **What to export** | | |
 | `--scan-types TYPES` | `sca` | `sca`, `containers` (or `container-security`), or both comma-separated |
 | `--dump-all` | off | Every retained scan instead of the latest per branch; implies `--raw-scan-report` |
@@ -327,7 +332,21 @@ Every option in one place. Run `python checkmarx_exposure.py --help` for the sam
 | `--export-timeout SECONDS` | 600 | Time allowed for Checkmarx to produce each SCA report |
 | `--product-map FILE.csv` | project name | Map projects to business products (see below) |
 
-`--dump-all` cannot be combined with `--branch`, `--ecosystems`, `--package` or `--cve`.
+`--dump-all` cannot be combined with `--branch`, `--ecosystems`, `--package`, `--cve` or `--db`.
+
+### Progress
+
+While it runs, the script shows its progress on stderr, so stdout and the output files
+stay clean. In a terminal this is one updating line:
+
+```text
+[########----------------]  33% 4/12 projects | 2m10s | ~4m20s left | payments-api: waiting for CycloneDxJson report (15s)
+```
+
+It shows projects done, time elapsed, an estimate of the time left (from the average
+per project so far), and the project, scan and step running now. When stderr is
+redirected to a file or CI log, it prints one plain line per project and per scan
+instead. Use `--no-progress` to turn it off.
 
 ### Map projects to products
 
@@ -339,6 +358,77 @@ project IDs (from `projects.csv`) and pass `--product-map products.csv`:
 project_id,product
 REPLACE_WITH_PROJECT_UUID,Product A
 ```
+
+## Load into PostgreSQL (incremental)
+
+Add `--db postgres.ini` to load findings into PostgreSQL as well. Each run loads only scans
+that are new since the last run, and keeps track of when every finding was first seen,
+fixed, or reopened.
+
+```powershell
+python -m pip install -r requirements-db.txt      # psycopg 3
+Copy-Item postgres.example.ini postgres.ini
+notepad postgres.ini                              # host, dbname, user; see below for the password
+python checkmarx_exposure.py --db postgres.ini --scan-types sca,containers
+```
+
+`postgres.ini` holds the connection settings (`host`, `port`, `dbname`, `user`,
+`password`, `sslmode`, `sslrootcert`, `connect_timeout`) and the `schema` to use
+(default `checkmarx`). Leave `password` empty to use the `PGPASSWORD` environment variable
+or a pgpass file instead of writing it in the file. Like `config.ini`, `postgres.ini` is
+ignored by Git. The user needs rights to create the schema on the first run, and to read
+and write its tables after that.
+
+**How a run works**
+
+- For each project, branch and scan type, the first run loads the newest completed scan
+  as the baseline. Later runs load every completed scan newer than the last one loaded,
+  oldest first, so a fix is dated by the scan that first showed it.
+- Scans that are already loaded are not exported again (`coverage.csv` status
+  `already_loaded`). A scan whose export failed is not recorded, so the next run tries
+  it again.
+- A finding is **fixed** when a newer completed scan of the same project, branch and scan
+  type no longer contains it. It is **reopened** if it comes back later.
+- Findings are never closed by a scan whose engine did not complete, or whose report had no
+  vulnerability section, because a missing result there says nothing about a fix.
+- Checkmarx triage (for example `not_affected` from SCA, or `NOT_EXPLOITABLE` for
+  containers) is kept in `triage_state`. It does not close a finding.
+- CSV and raw files are still written. A run with `--db` gets a new timestamped folder
+  under `checkmarx-output` unless you pass `--out`. Add `--no-files` to load only the
+  database.
+- `--db` cannot be combined with `--dump-all`; the database builds the history instead.
+
+**Finding identity.** SCA findings are keyed on vulnerability, ecosystem and package
+name, not the version, so moving to another version that is still vulnerable keeps the
+same finding (the versions are in `versions`). Container findings are keyed on
+vulnerability, image name (not the tag), image file and package, so a new image tag from
+the next build does not look like a fix.
+
+**Tables** (in the configured schema):
+
+| Table | Contents |
+| --- | --- |
+| `findings` | One row per finding per project, branch and scan type: `status` (`open`/`fixed`), `first_seen_at`, `last_seen_at`, `fixed_at`, the scan IDs for each, `reopened_count`, `severity`, `triage_state`, package or image details, and the full row in `details` |
+| `finding_events` | History: `new`, `fixed` and `reopened`, with the scan and its date |
+| `open_findings` (view) | Open findings with project name, product and applications |
+| `projects`, `scans` | Latest project metadata and every scan seen |
+| `scan_loads` | Which scan was loaded for which scan type, and whether it could close findings |
+| `branch_state` | The last scan loaded per project, branch and scan type |
+| `runs` | One row per run, with the `run.json` summary and database counts |
+
+```sql
+-- Open critical/high findings, oldest first
+SELECT project, branch, engine, vulnerability, package, versions, image_name, triage_state, first_seen_at
+FROM checkmarx.open_findings WHERE severity IN ('critical', 'high') ORDER BY first_seen_at;
+
+-- Fixed in the last 30 days, with time to fix
+SELECT project_id, branch, vulnerability, package, fixed_at, fixed_at - first_seen_at AS time_to_fix
+FROM checkmarx.findings WHERE status = 'fixed' AND fixed_at > now() - interval '30 days';
+```
+
+`first_seen_at` is the date of the first scan this tool loaded that contained the
+finding (Container Security's own `firstFoundAt` when it is earlier). For findings that
+already existed before your first `--db` run, it is the baseline scan's date.
 
 ## Output files
 
@@ -417,14 +507,19 @@ time**, not at scan time.
 | `export_error` | Report generation or download failed; see `error` |
 | `scan_list_error` | The project's scans could not be listed |
 | `no_scans_in_scope` | No scans (on `--branch`, if given) |
+| `already_loaded` | `--db` only: this scan is already in the database, so it was not exported again |
 
 - `scan_type`: `sca` or `containers`.
 - `newer_scan_than_selected = True`: a newer scan exists than the one exported (it may
   have failed, still be running, or lack that engine). Worth a look.
 - For container rows, `package_count` is the number of distinct image/package/version
   combinations with findings (Checkmarx's results list holds only vulnerable packages).
-- `scan_role` (`--dump-all`): `current` for each branch's newest completed SCA scan,
-  `historical` for older ones.
+- `scan_role`: `current` for the evidence that represents each branch today: the
+  selected scan in latest mode, and in `--dump-all` each branch's newest scan whose
+  engine completed (or the newest scan, if none completed). Other scans are `historical`.
+- A branch with no completed scan for a requested scan type is `current` with
+  `no_confirmed_completed_*`, so it makes the run exit 2. With `--scan-types
+  sca,containers`, projects that never ran Container Security are flagged too.
 
 ### Exit codes
 
@@ -444,27 +539,40 @@ outside the API identity's permissions, cannot be exported.
   files except `config.example.ini` are ignored by Git. **Never commit a real config**:
   this repository is public.
 - Credentials are never written to output files or error messages. Error text has
-  request paths, query strings and proxy passwords removed.
+  request paths, query strings and proxy passwords removed. Local file errors (for
+  example an existing `--out` folder) show the reason and path.
 - Reports are downloaded from the authenticated
   `/api/sca/export/requests/{exportId}/download` endpoint on your `base_url`; container
   results are read from `/api/results` on the same host. If that
   redirects to another host (for example cloud storage), the API token is not sent there.
 - Report files are saved byte-for-byte as received.
 - CSV cells starting with `=`, `+`, `-` or `@` get a leading `'` so Excel does not run
-  them as formulas. The raw JSON keeps the original values.
+  them as formulas. This also changes scoped npm names (`@scope/pkg` becomes
+  `'@scope/pkg`). If the CSVs feed a script, database or Power BI rather than Excel, use
+  `--raw-csv` to keep values unchanged. The `purl` column and raw JSON are never changed.
+- `postgres.ini` may hold a database password; prefer `PGPASSWORD` or a pgpass file, and
+  use `sslmode = verify-full` for a database on another machine. Database errors are
+  shown without the password.
 - Treat all output as internal security information.
 
 ## Development
 
 ```powershell
-python -m unittest -v test_checkmarx_exposure.py
+python -m unittest -v test_checkmarx_exposure.py test_checkmarx_db.py
 ```
+
+The PostgreSQL tests are skipped unless `CX_TEST_PG` points at a disposable database,
+for example `CX_TEST_PG="host=localhost port=5432 user=postgres dbname=postgres"`. Each
+test creates its own schema and drops it afterwards.
 
 The tests use mocked API responses and sample CycloneDX data: pagination, per-branch
 fallback when SCA failed, container results and their paging, scan-type selection,
 project ID lists and CSV files, finding and project filters, unlinked references, missing
-vulnerability data, export polling (including temporary 400/404 replies), downloads
-and redirects, UTF-8 BOM handling, SSL settings, config handling and secret redaction.
+vulnerability data, export polling (including temporary 400/404 replies and 429 rate limits), short
+result pages, missing-scan coverage gaps, progress output, downloads
+and redirects, UTF-8 BOM handling, SSL settings, config handling and secret redaction,
+and incremental PostgreSQL loading (baseline, new, fixed, reopened, failed scans,
+missing vulnerability sections, retries after export errors, containers).
 They have not been run against a live tenant.
 
 API behaviour is based on the Checkmarx documentation and the official Checkmarx CLI:
