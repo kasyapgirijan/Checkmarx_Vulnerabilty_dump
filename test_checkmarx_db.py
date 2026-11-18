@@ -56,6 +56,14 @@ class UnitTests(unittest.TestCase):
             path.write_text('[postgres]\nhots = typo\n')
             with self.assertRaisesRegex(db.DatabaseError, 'hots'):
                 db.load_db_settings(path)
+            path.write_text('[postgres]\ndatabase = jira_style\n')  # Jira_extract's key name.
+            self.assertEqual(db.load_db_settings(path)[0], {'dbname': 'jira_style'})
+            path.write_text('[postgres]\ndatabase = a\ndbname = b\n')
+            with self.assertRaisesRegex(db.DatabaseError, 'not both'):
+                db.load_db_settings(path)
+            path.write_text('[checkmarx]\nbase_url = https://x\n')
+            with self.assertRaisesRegex(db.DatabaseError, 'no \\[postgres\\] section'):
+                db.load_db_settings(path)
             with self.assertRaisesRegex(db.DatabaseError, 'does not exist'):
                 db.load_db_settings(Path(tmp) / 'missing.ini')
 
@@ -96,6 +104,10 @@ class UnitTests(unittest.TestCase):
                     cx.parse_args(bad)
         self.assertEqual(cx.parse_args([]).out, 'checkmarx-output')
         self.assertTrue(cx.parse_args(['--db', 'x.ini']).out.startswith('checkmarx-output/20'))
+        self.assertEqual(cx.parse_args(['--db']).db, '')  # Alone: [postgres] in the main config.
+        self.assertIsNone(cx.parse_args([]).db)
+        with patch('sys.stderr'), self.assertRaises(SystemExit):
+            cx.parse_args(['--full'])
 
 
 @unittest.skipUnless(PG, 'set CX_TEST_PG to run the PostgreSQL tests')
@@ -180,7 +192,7 @@ class PostgresTests(unittest.TestCase):
         fixed_at = self.conn.execute(f'SELECT fixed_at FROM {self.schema}.findings WHERE finding_key = %s',
                                      (npm,)).fetchone()[0]
         self.assertEqual(fixed_at, datetime(2026, 10, 5, tzinfo=timezone.utc))
-        open_rows = self.conn.execute(f'SELECT project, finding_key FROM {self.schema}.open_findings').fetchall()
+        open_rows = self.conn.execute(f'SELECT project, finding_key FROM {self.schema}.vw_open_findings').fetchall()
         self.assertEqual(open_rows, [('Project', pypi)])
 
     def test_package_inventory(self):
@@ -209,9 +221,63 @@ class PostgresTests(unittest.TestCase):
             ('org.apache.logging.log4j/log4j-core', '2.17.1', 'transitive', 'org.springframework/spring-core@6.0',
              'present', 's2', None),
             ('org.springframework/spring-core', '6.0', 'direct', '', 'present', 's1', None)])
-        java = self.conn.execute(f"SELECT DISTINCT project FROM {self.schema}.current_packages "
+        java = self.conn.execute(f"SELECT DISTINCT project FROM {self.schema}.vw_current_packages "
                                  f"WHERE ecosystem = 'maven'").fetchall()
         self.assertEqual(java, [('Project',)])
+
+    def test_postgres_section_in_main_config(self):
+        keywords = dict(part.split('=', 1) for part in PG.split())
+        main_config = Path(self.tmp.name) / 'config.ini'
+        main_config.write_text('[checkmarx]\nbase_url = https://x\n\n[postgres]\n'
+                               + ''.join(f'{"database" if k == "dbname" else k} = {v}\n' for k, v in keywords.items())
+                               + f'schema = {self.schema}\n')
+        self.scans, self.boms = [scan('s1', 1)], {'s1': bom('npm-a')}
+        with patch('sys.stdout'), patch('sys.stderr'):
+            code = cx.main(['--db', '--config', str(main_config), '--no-files', '--stale-days', '3650'])
+        self.assertEqual(code, 0)
+        self.assertEqual(len(self.findings()), 1)
+
+    def test_run_status_full_reload_and_lock(self):
+        self.scans, self.boms = [scan('s1', 1)], {'s1': bom('npm-a')}
+        self.run_export()
+        self.run_export('--full')  # Reloads s1 although it is already loaded.
+        self.assertEqual(self.client.export.call_count, 2)
+        self.assertEqual(self.findings()['CVE-A|npm|@scope/thing'][0], 'open')
+        # A database failure mid-run marks the run FAILED with the reason.
+        with patch.object(db.Store, 'save_scans', side_effect=db.DatabaseError('PostgreSQL: boom')):
+            with self.assertRaisesRegex(db.DatabaseError, 'boom'):
+                self.run_export()
+        runs = self.conn.execute(f'SELECT status, error FROM {self.schema}.runs ORDER BY run_id').fetchall()
+        self.assertEqual(runs, [('SUCCESS', None), ('SUCCESS', None), ('FAILED', 'PostgreSQL: boom')])
+        # A second load into the same schema while one holds the lock is refused.
+        holder = db.Store.connect(self.ini)
+        try:
+            with self.assertRaisesRegex(db.DatabaseError, 'already running'):
+                db.Store.connect(self.ini)
+        finally:
+            holder.close()
+        db.Store.connect(self.ini).close()  # Released when the first connection closes.
+
+    def test_upgrades_a_database_from_the_first_release(self):
+        # Schema as PR #6 created it: old index and view names, runs without status/error.
+        old = db.SCHEMA_SQL.replace('ALTER INDEX IF EXISTS', '-- ').replace('idx_findings_status', 'findings_status_idx')
+        self.conn.execute(f'CREATE SCHEMA {self.schema}')
+        self.conn.execute(f'SET search_path TO {self.schema}')
+        self.conn.execute(old)
+        self.conn.execute('ALTER TABLE runs DROP COLUMN IF EXISTS status')
+        self.conn.execute("CREATE VIEW open_findings AS SELECT * FROM findings WHERE status = 'open'")
+        db.Store.connect(self.ini).close()
+        names = {r[0] for r in self.conn.execute(
+            "SELECT indexname FROM pg_indexes WHERE schemaname = %s", (self.schema,))}
+        self.assertIn('idx_findings_status', names)
+        self.assertNotIn('findings_status_idx', names)
+        views = {r[0] for r in self.conn.execute(
+            "SELECT table_name FROM information_schema.views WHERE table_schema = %s", (self.schema,))}
+        self.assertEqual(views, {'vw_open_findings', 'vw_current_packages'})
+        columns = {r[0] for r in self.conn.execute(
+            "SELECT column_name FROM information_schema.columns WHERE table_schema = %s AND table_name = 'runs'",
+            (self.schema,))}
+        self.assertTrue({'status', 'error'} <= columns)
 
     def test_missing_vulnerability_section_never_closes(self):
         self.scans = [scan('s1', 1)]
