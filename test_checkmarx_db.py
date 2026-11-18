@@ -273,11 +273,26 @@ class PostgresTests(unittest.TestCase):
         self.assertNotIn('findings_status_idx', names)
         views = {r[0] for r in self.conn.execute(
             "SELECT table_name FROM information_schema.views WHERE table_schema = %s", (self.schema,))}
-        self.assertEqual(views, {'vw_open_findings', 'vw_current_packages'})
+        self.assertEqual(views, {'vw_findings', 'vw_open_findings', 'vw_current_packages'})
         columns = {r[0] for r in self.conn.execute(
             "SELECT column_name FROM information_schema.columns WHERE table_schema = %s AND table_name = 'runs'",
             (self.schema,))}
         self.assertTrue({'status', 'error'} <= columns)
+
+    def test_project_name_on_every_table(self):
+        self.scans, self.boms = [scan('s1', 1)], {'s1': bom('npm-a')}
+        self.run_export()
+        for table in ('findings', 'packages', 'finding_events'):
+            names = self.conn.execute(f'SELECT DISTINCT project_name FROM {self.schema}.{table}').fetchall()
+            self.assertEqual(names, [('Project',)], table)
+        # A renamed project is updated on the next run.
+        self.client.pages.side_effect = lambda path, key, **kw: iter(
+            {'projects': [{'id': 'p', 'name': 'Renamed'}], 'applications': [], 'scans': list(self.scans)}[key])
+        self.run_export()
+        self.assertEqual(self.conn.execute(f'SELECT DISTINCT project_name FROM {self.schema}.findings').fetchall(),
+                         [('Renamed',)])
+        rows = self.conn.execute(f'SELECT project, status FROM {self.schema}.vw_findings').fetchall()
+        self.assertEqual(rows, [('Renamed', 'open')])
 
     def test_missing_vulnerability_section_never_closes(self):
         self.scans = [scan('s1', 1)]

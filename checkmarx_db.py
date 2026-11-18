@@ -150,6 +150,17 @@ ALTER TABLE runs ADD COLUMN IF NOT EXISTS error text;
 CREATE INDEX IF NOT EXISTS idx_findings_severity ON findings (severity);
 CREATE INDEX IF NOT EXISTS idx_findings_project ON findings (project_id);
 CREATE INDEX IF NOT EXISTS idx_packages_project ON packages (project_id);
+ALTER TABLE findings ADD COLUMN IF NOT EXISTS project_name text;
+ALTER TABLE packages ADD COLUMN IF NOT EXISTS project_name text;
+ALTER TABLE finding_events ADD COLUMN IF NOT EXISTS project_name text;
+"""
+
+# The project name is copied onto findings, packages and finding_events so each table reads
+# on its own (the projects table stays the source; a renamed project is updated everywhere).
+NAME_TABLES = ('findings', 'packages', 'finding_events')
+BACKFILL_SQL = """
+UPDATE {table} t SET project_name = p.name FROM projects p
+WHERE t.project_id = p.project_id AND t.project_name IS DISTINCT FROM p.name
 """
 
 # Views are dropped and recreated on every run: CREATE OR REPLACE VIEW fails once a table
@@ -159,6 +170,10 @@ DROP VIEW IF EXISTS open_findings;
 DROP VIEW IF EXISTS current_packages;
 DROP VIEW IF EXISTS vw_open_findings;
 DROP VIEW IF EXISTS vw_current_packages;
+DROP VIEW IF EXISTS vw_findings;
+CREATE VIEW vw_findings AS
+    SELECT p.name AS project, p.product, p.applications, f.*
+    FROM findings f LEFT JOIN projects p USING (project_id);
 CREATE VIEW vw_open_findings AS
     SELECT p.name AS project, p.product, p.applications, f.*
     FROM findings f LEFT JOIN projects p USING (project_id)
@@ -345,6 +360,8 @@ class Store:
             cur.execute(sql.SQL('SET search_path TO {}').format(sql.Identifier(self.schema)))
             cur.execute(SCHEMA_SQL)
             cur.execute(MIGRATIONS_SQL)
+            for table in NAME_TABLES:
+                cur.execute(BACKFILL_SQL.format(table=table))
             cur.execute(VIEWS_SQL)
         # search_path set inside a committed transaction stays for the session.
 
@@ -396,6 +413,12 @@ class Store:
                       context.get('applications', ''), context.get('application_ids_json') or '[]',
                       jsonb(project.get('tags')), jsonb(project.get('groups')), project.get('mainBranch', ''),
                       project.get('repoUrl', ''), self.run_id))
+            self._copy_project_name(cur, str(project['id']))
+
+    def _copy_project_name(self, cur, project_id):
+        """Write projects.name onto this project's findings, packages and events (new rows, renames)."""
+        for table in NAME_TABLES:
+            cur.execute(BACKFILL_SQL.format(table=table) + ' AND t.project_id = %s', (project_id,))
 
     def save_scans(self, project_id, scans):
         if not scans:
@@ -496,6 +519,7 @@ class Store:
                     """, [(*e, scan_id, created, self.run_id) for e in events])
             if packages is not None:
                 self._load_packages(cur, where[:2], scan_id, created, package_inventory(packages))
+            self._copy_project_name(cur, pid)
             cur.execute("""
                 INSERT INTO scan_loads (scan_id, engine, project_id, branch, scan_created_at, vulnerability_section,
                                         finding_count, closed_findings, loaded_at, run_id)

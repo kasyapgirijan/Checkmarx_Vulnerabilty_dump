@@ -437,8 +437,9 @@ the next build does not look like a fix.
 
 | Table | Contents |
 | --- | --- |
-| `findings` | One row per finding per project, branch and scan type: `status` (`open`/`fixed`), `first_seen_at`, `last_seen_at`, `fixed_at`, the scan IDs for each, `reopened_count`, `severity`, `triage_state`, package or image details, and the full row in `details` |
+| `findings` | One row per finding per project, branch and scan type, with `project_id` and `project_name`: `status` (`open`/`fixed`), `first_seen_at`, `last_seen_at`, `fixed_at`, the scan IDs for each, `reopened_count`, `severity`, `triage_state`, package or image details, and the full row in `details` |
 | `finding_events` | History: `new`, `fixed` and `reopened`, with the scan and its date |
+| `vw_findings` (view) | All findings, open and fixed, with project name, product and applications |
 | `vw_open_findings` (view) | Open findings with project name, product and applications. Point Power BI here |
 | `packages` | Package inventory per project and branch, vulnerable or not: `ecosystem`, `package`, `version`, `dependency_type`, `introduced_by`, `status` (`present`/`removed`), first and last seen, and when it was removed. Keyed with the version, so an upgrade shows the old version as removed and the new one as present |
 | `vw_current_packages` (view) | Packages present now, with project name, product and applications |
