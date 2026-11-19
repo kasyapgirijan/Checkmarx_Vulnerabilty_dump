@@ -130,7 +130,7 @@ class PostgresTests(unittest.TestCase):
         self.client.pages.side_effect = lambda path, key, **kw: iter(
             {'projects': [{'id': 'p', 'name': 'Project'}], 'applications': [], 'scans': list(self.scans)}[key])
         self.client.export.side_effect = lambda sid, fmt, timeout: json.dumps(self.boms[sid]).encode()
-        self.client.results.side_effect = lambda sid, kind: copy.deepcopy(self.results[sid])
+        self.client.results.side_effect = lambda sid, kind: copy.deepcopy(self.results.get(sid, []))
 
     def tearDown(self):
         self.conn.execute(f'DROP SCHEMA IF EXISTS {self.schema} CASCADE')
@@ -141,7 +141,7 @@ class PostgresTests(unittest.TestCase):
         self.runs += 1
         out = Path(self.tmp.name) / f'out{self.runs}'
         with patch('sys.stdout'), patch('sys.stderr'):
-            return cx.main(['--db', str(self.ini), '--out', str(out), '--stale-days', '3650', *extra]), out
+            return cx.main(['--db', str(self.ini), '--out', str(out), '--stale-days', '3650', '--keep-states', 'all', *extra]), out
 
     def findings(self, engine='sca'):
         rows = self.conn.execute(
@@ -161,8 +161,8 @@ class PostgresTests(unittest.TestCase):
         code, out = self.run_export()
         self.assertEqual(code, 0)
         self.assertEqual(self.client.export.call_count, 1)
-        self.assertEqual(self.findings(), {npm: ('open', 's1', 's1', None, 0, 'not_affected'),
-                                           pypi: ('open', 's1', 's1', None, 0, 'not_affected')})
+        self.assertEqual(self.findings(), {npm: ('open', 's1', 's1', None, 0, 'NOT_EXPLOITABLE'),
+                                           pypi: ('open', 's1', 's1', None, 0, 'NOT_EXPLOITABLE')})
         self.assertTrue((out / 'findings.csv').exists())  # CSV export still happens.
         self.assertEqual(json.loads((out / 'run.json').read_text())['database']['new'], 2)
 
@@ -178,7 +178,7 @@ class PostgresTests(unittest.TestCase):
         code, _ = self.run_export()
         self.assertEqual(code, 0)
         self.assertEqual([c.args[0] for c in self.client.export.call_args_list[1:]], ['s2', 's3'])
-        self.assertEqual(self.findings()[pypi], ('open', 's1', 's3', None, 1, 'not_affected'))
+        self.assertEqual(self.findings()[pypi], ('open', 's1', 's3', None, 1, 'NOT_EXPLOITABLE'))
         self.assertEqual(self.events()[2:], [('s2', 'fixed', pypi), ('s3', 'reopened', pypi)])
 
         # Run 4: npm fixed in s4; a newer scan whose SCA failed (s5) never closes anything.
@@ -233,7 +233,7 @@ class PostgresTests(unittest.TestCase):
                                + f'schema = {self.schema}\n')
         self.scans, self.boms = [scan('s1', 1)], {'s1': bom('npm-a')}
         with patch('sys.stdout'), patch('sys.stderr'):
-            code = cx.main(['--db', '--config', str(main_config), '--no-files', '--stale-days', '3650'])
+            code = cx.main(['--db', '--config', str(main_config), '--no-files', '--stale-days', '3650', '--keep-states', 'all'])
         self.assertEqual(code, 0)
         self.assertEqual(len(self.findings()), 1)
 
@@ -289,7 +289,7 @@ class PostgresTests(unittest.TestCase):
         views = {r[0] for r in self.conn.execute(
             "SELECT table_name FROM information_schema.views WHERE table_schema = %s", (self.schema,))}
         self.assertEqual(views, {'vw_findings', 'vw_open_findings', 'vw_current_packages', 'vw_branch_state',
-                                 'vw_category_summary', 'vw_sca', 'vw_containers', 'vw_sast', 'vw_iac', 'vw_secrets'})
+                                 'vw_category_summary', 'vw_unique_open_findings', 'vw_sca', 'vw_containers', 'vw_sast', 'vw_iac', 'vw_secrets'})
         columns = {r[0] for r in self.conn.execute(
             "SELECT column_name FROM information_schema.columns WHERE table_schema = %s AND table_name = 'runs'",
             (self.schema,))}
@@ -344,7 +344,7 @@ class PostgresTests(unittest.TestCase):
         self.scans = [scan('c1', 1, engine='containers')]
         self.results = {'c1': [result('1.0')]}
         with patch('sys.stdout'), patch('sys.stderr'):
-            self.assertEqual(cx.main(['--db', str(self.ini), '--no-files', '--scan-types', 'containers',
+            self.assertEqual(cx.main(['--db', str(self.ini), '--no-files', '--keep-states', 'all', '--scan-types', 'containers',
                                       '--stale-days', '3650']), 0)
         self.scans.append(scan('c2', 2, engine='containers'))
         self.results['c2'] = [result('2.0', 'NOT_EXPLOITABLE')]  # New image tag, same finding, triaged.
@@ -393,6 +393,52 @@ class PostgresTests(unittest.TestCase):
         self.assertEqual(summary, [('kics', 1, 0), ('sast', 1, 0), ('secrets', 0, 1)])
         events = self.conn.execute(f'SELECT count(*) FROM {self.schema}.finding_events WHERE finding_id IS NULL')
         self.assertEqual(events.fetchone(), (0,))
+
+    def test_only_true_positives_are_loaded(self):
+        def sast(sim, state):
+            return {'type': 'sast', 'id': 'r' + sim, 'similarityId': sim, 'severity': 'HIGH', 'state': state,
+                    'data': {'queryName': 'SQL_Injection', 'nodes': [{'fileName': 'a.java', 'line': 1}]}}
+        status = [{'name': 'sast', 'status': 'Completed'}]
+        self.scans = [{**scan('t1', 1), 'statusDetails': status}]
+        self.results = {'t1': [sast('1', 'CONFIRMED'), sast('2', 'TO_VERIFY'), sast('3', 'NOT_EXPLOITABLE'),
+                               sast('4', 'PROPOSED_NOT_EXPLOITABLE')]}
+        _, out = self.run_export('--scan-types', 'sast', '--keep-states', 'CONFIRMED,URGENT')
+        self.assertEqual(list(self.findings('sast')), ['sim:1'])
+        with (out / 'findings.csv').open(encoding='utf-8-sig') as f:
+            self.assertEqual([r['similarity_id'] for r in csv.DictReader(f)], ['1'])
+        with (out / 'coverage.csv').open(encoding='utf-8-sig') as f:
+            self.assertEqual([(r['finding_count'], r['excluded_findings']) for r in csv.DictReader(f)], [('1', '3')])
+        # Scan 2: 1 is re-triaged as not exploitable (excluded, not fixed); 2 becomes Urgent (new).
+        self.scans.append({**scan('t2', 2), 'statusDetails': status})
+        self.results['t2'] = [sast('1', 'NotExploitable'), sast('2', 'URGENT')]
+        self.run_export('--scan-types', 'sast', '--keep-states', 'CONFIRMED,URGENT')
+        self.assertEqual({k: v[0] for k, v in self.findings('sast').items()}, {'sim:1': 'excluded', 'sim:2': 'open'})
+        # Scan 3: 1 is confirmed again (open); 2 is gone (fixed).
+        self.scans.append({**scan('t3', 3), 'statusDetails': status})
+        self.results['t3'] = [sast('1', 'CONFIRMED')]
+        self.run_export('--scan-types', 'sast', '--keep-states', 'CONFIRMED,URGENT')
+        self.assertEqual({k: v[0] for k, v in self.findings('sast').items()}, {'sim:1': 'open', 'sim:2': 'fixed'})
+        events = self.conn.execute(f"SELECT finding_key, event FROM {self.schema}.finding_events ORDER BY event_id")
+        self.assertEqual(events.fetchall(), [('sim:1', 'new'), ('sim:2', 'new'), ('sim:1', 'excluded'),
+                                             ('sim:2', 'fixed'), ('sim:1', 'included')])
+
+    def test_sca_states_come_from_the_results_api(self):
+        self.scans = [scan('s1', 1)]
+        self.boms = {'s1': bom('npm-a', 'py-b')}
+        self.results = {'s1': [  # Checkmarx triage: the npm one is confirmed, django was never triaged.
+            {'type': 'sca', 'id': 'CVE-A', 'state': 'CONFIRMED', 'data': {'packageIdentifier': 'Npm-@scope/thing-1.2.3'}},
+            {'type': 'sca', 'id': 'CVE-A', 'state': 'TO_VERIFY', 'data': {'scaPackageData': {
+                'dependencyPaths': [[{'name': 'django', 'version': '1.0'}]]}}}]}
+        self.run_export('--keep-states', 'CONFIRMED,URGENT')
+        self.assertEqual(self.findings(), {'CVE-A|npm|@scope/thing': ('open', 's1', 's1', None, 0, 'CONFIRMED')})
+
+    def test_unique_open_findings_across_branches(self):
+        self.scans = [scan('m1', 1), scan('d1', 1, branch='dev')]
+        self.boms = {'m1': bom('npm-a'), 'd1': bom('npm-a')}
+        self.run_export()
+        rows = self.conn.execute(f'SELECT vulnerability, package, branches, branch_count '
+                                 f'FROM {self.schema}.vw_unique_open_findings').fetchall()
+        self.assertEqual(rows, [('CVE-A', '@scope/thing', 'dev; main', 2)])
 
     def test_bad_connection_is_a_clean_error(self):
         self.ini.write_text('[postgres]\nhost = 127.0.0.1\nport = 1\nconnect_timeout = 2\npassword = hunter2\n')
