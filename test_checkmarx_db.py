@@ -74,7 +74,7 @@ class UnitTests(unittest.TestCase):
         self.assertEqual(list(records), ['CVE-1|npm|a'])
         self.assertEqual((records['CVE-1|npm|a']['versions'], records['CVE-1|npm|a']['severity']), ('1.0; 2.0', 'high'))
         container = {'vulnerability': 'CVE-2', 'image_name': 'nginx', 'image_file_path': 'Dockerfile',
-                     'package': 'zlib', 'image_tag': '1.0', 'state': 'NOT_EXPLOITABLE'}
+                     'package': 'zlib', 'image_tag': '1.0', 'triage_state': 'NOT_EXPLOITABLE'}
         self.assertEqual(db.finding_key(container, 'containers'),
                          db.finding_key({**container, 'image_tag': '2.0'}, 'containers'))
         self.assertEqual(db.normalize([container], 'containers')['CVE-2|nginx|Dockerfile|zlib']['triage_state'],
@@ -266,18 +266,49 @@ class PostgresTests(unittest.TestCase):
         self.conn.execute(old)
         self.conn.execute('ALTER TABLE runs DROP COLUMN IF EXISTS status')
         self.conn.execute("CREATE VIEW open_findings AS SELECT * FROM findings WHERE status = 'open'")
+        # Data as earlier releases stored it: branch_state table, events keyed by four columns, no category.
+        self.conn.execute('CREATE TABLE branch_state (project_id text NOT NULL, branch text NOT NULL, '
+                          'engine text NOT NULL, last_scan_id text NOT NULL, last_scan_created_at timestamptz, '
+                          'updated_at timestamptz NOT NULL, PRIMARY KEY (project_id, branch, engine))')
+        self.conn.execute("INSERT INTO branch_state VALUES ('p', 'main', 'containers', 's9', '2026-10-09', now())")
+        self.conn.execute("INSERT INTO findings (project_id, branch, engine, finding_key, vulnerability, status, "
+                          "details, updated_at) VALUES ('p', 'main', 'containers', 'k', 'CVE-9', 'open', "
+                          "'{\"cwe\": \"CWE-502\"}', now())")
+        self.conn.execute("INSERT INTO finding_events (project_id, branch, engine, finding_key, event) "
+                          "VALUES ('p', 'main', 'containers', 'k', 'new')")
         db.Store.connect(self.ini).close()
+        self.assertIsNone(self.conn.execute("SELECT to_regclass('branch_state')").fetchone()[0])
+        self.assertEqual(self.conn.execute('SELECT last_scan_id FROM vw_branch_state').fetchall(), [('s9',)])
+        finding_id, category, cwe = self.conn.execute('SELECT finding_id, category, cwe FROM findings').fetchone()
+        self.assertEqual((category, cwe), ('Deserialization', 'CWE-502'))
+        self.assertEqual(self.conn.execute('SELECT finding_id FROM finding_events').fetchall(), [(finding_id,)])
         names = {r[0] for r in self.conn.execute(
             "SELECT indexname FROM pg_indexes WHERE schemaname = %s", (self.schema,))}
         self.assertIn('idx_findings_status', names)
         self.assertNotIn('findings_status_idx', names)
         views = {r[0] for r in self.conn.execute(
             "SELECT table_name FROM information_schema.views WHERE table_schema = %s", (self.schema,))}
-        self.assertEqual(views, {'vw_open_findings', 'vw_current_packages'})
+        self.assertEqual(views, {'vw_findings', 'vw_open_findings', 'vw_current_packages', 'vw_branch_state',
+                                 'vw_category_summary', 'vw_sca', 'vw_containers', 'vw_sast', 'vw_iac', 'vw_secrets'})
         columns = {r[0] for r in self.conn.execute(
             "SELECT column_name FROM information_schema.columns WHERE table_schema = %s AND table_name = 'runs'",
             (self.schema,))}
         self.assertTrue({'status', 'error'} <= columns)
+
+    def test_project_name_on_every_table(self):
+        self.scans, self.boms = [scan('s1', 1)], {'s1': bom('npm-a')}
+        self.run_export()
+        for table in ('findings', 'packages', 'finding_events'):
+            names = self.conn.execute(f'SELECT DISTINCT project_name FROM {self.schema}.{table}').fetchall()
+            self.assertEqual(names, [('Project',)], table)
+        # A renamed project is updated on the next run.
+        self.client.pages.side_effect = lambda path, key, **kw: iter(
+            {'projects': [{'id': 'p', 'name': 'Renamed'}], 'applications': [], 'scans': list(self.scans)}[key])
+        self.run_export()
+        self.assertEqual(self.conn.execute(f'SELECT DISTINCT project_name FROM {self.schema}.findings').fetchall(),
+                         [('Renamed',)])
+        rows = self.conn.execute(f'SELECT project, status FROM {self.schema}.vw_findings').fetchall()
+        self.assertEqual(rows, [('Renamed', 'open')])
 
     def test_missing_vulnerability_section_never_closes(self):
         self.scans = [scan('s1', 1)]
@@ -326,6 +357,42 @@ class PostgresTests(unittest.TestCase):
         self.results['c3'] = []
         self.run_export('--scan-types', 'containers')
         self.assertEqual(self.findings('containers')[key][0], 'fixed')
+
+    def test_sast_iac_and_secrets_share_the_findings_table(self):
+        sast = {'type': 'sast', 'id': 'r1', 'similarityId': '77', 'severity': 'HIGH', 'state': 'TO_VERIFY',
+                'vulnerabilityDetails': {'cweId': 89},
+                'data': {'queryName': 'SQL_Injection', 'languageName': 'Java',
+                         'nodes': [{'fileName': 'Dao.java', 'line': 10}]}}
+        kics = {'type': 'kics', 'id': 'r2', 'similarityId': '88', 'severity': 'MEDIUM',
+                'data': {'queryName': 'Privileged Container', 'group': 'Insecure Configurations',
+                         'platform': 'Kubernetes', 'fileName': 'deploy.yaml', 'line': 3}}
+        secret = {'type': 'sscs-secret-detection', 'id': 'r3', 'similarityId': '99', 'severity': 'HIGH',
+                  'data': {'ruleName': 'github-pat', 'fileName': '.env', 'line': 1}}
+        status = [{'name': n, 'status': 'Completed'} for n in ('sast', 'kics', 'microengines')]
+        self.scans = [{**scan('x1', 1), 'statusDetails': status}]
+        self.results = {'x1': [sast, kics, secret]}
+        _, out = self.run_export('--scan-types', 'sast,iac,secrets')
+        self.client.results.assert_called_once()  # One /api/results fetch serves all three engines.
+        with (out / 'findings.csv').open(encoding='utf-8-sig') as f:
+            self.assertEqual(sorted(r['engine'] for r in csv.DictReader(f)), ['kics', 'sast', 'secrets'])
+        rows = self.conn.execute(f'SELECT engine, finding_key, category, cwe, file_path, line FROM {self.schema}.findings '
+                                 'ORDER BY engine').fetchall()
+        self.assertEqual(rows, [('kics', 'sim:88', 'IaC: Insecure Configurations', '', 'deploy.yaml', '3'),
+                                ('sast', 'sim:77', 'SQL/NoSQL Injection', 'CWE-89', 'Dao.java', '10'),
+                                ('secrets', 'sim:99', 'Hardcoded Credentials / Secrets', '', '.env', '1')])
+        self.assertEqual(self.conn.execute(f'SELECT language FROM {self.schema}.vw_sast').fetchall(), [('Java',)])
+        # The SQL injection moved to another line (same similarity id); the secret was removed.
+        moved = {**sast, 'data': {**sast['data'], 'nodes': [{'fileName': 'Dao.java', 'line': 25}]}}
+        self.scans.append({**scan('x2', 2), 'statusDetails': status})
+        self.results['x2'] = [moved, kics]
+        self.run_export('--scan-types', 'sast,iac,secrets')
+        self.assertEqual(self.findings('sast')['sim:77'][:3], ('open', 'x1', 'x2'))
+        self.assertEqual(self.findings('secrets')['sim:99'][0], 'fixed')
+        summary = self.conn.execute(f'SELECT engine, open_findings, fixed_findings FROM {self.schema}.vw_category_summary '
+                                    'ORDER BY engine').fetchall()
+        self.assertEqual(summary, [('kics', 1, 0), ('sast', 1, 0), ('secrets', 0, 1)])
+        events = self.conn.execute(f'SELECT count(*) FROM {self.schema}.finding_events WHERE finding_id IS NULL')
+        self.assertEqual(events.fetchone(), (0,))
 
     def test_bad_connection_is_a_clean_error(self):
         self.ini.write_text('[postgres]\nhost = 127.0.0.1\nport = 1\nconnect_timeout = 2\npassword = hunter2\n')

@@ -20,7 +20,7 @@ class Tests(unittest.TestCase):
         self.assertEqual(len(packages), 2)
         self.assertEqual([f['package'] for f in findings], ['@scope/thing', 'django'])
         self.assertEqual(findings[0]['severity'], 'high')
-        self.assertEqual(findings[0]['analysis_state'], 'not_affected')
+        self.assertEqual(findings[0]['triage_state'], 'not_affected')
         self.assertEqual((status, unresolved), ('present', 0))
         matches = cx.finding_filter(argparse.Namespace(ecosystems='python', package='django', cve='cve-test-1'))
         self.assertFalse(matches(findings[0]))
@@ -32,7 +32,7 @@ class Tests(unittest.TestCase):
         b = bom()
         b['vulnerabilities'][0].update(analysis=None, source=None, references=None, ratings=None)
         finding = cx.flatten(b, {})[1][0]
-        self.assertEqual((finding['analysis_state'], finding['severity']), ('', 'unknown'))
+        self.assertEqual((finding['triage_state'], finding['severity']), ('', 'unknown'))
 
     def test_unknown_is_not_clean(self):
         b = bom()
@@ -237,10 +237,11 @@ class Tests(unittest.TestCase):
             self.assertEqual(cx.main(['--scan-types', 'container-security', '--project-ids-file', str(ids),
                                       '--out', str(out)]), 2)  # Unknown ID and newer failed scan are flagged.
             client.export.assert_not_called()
-            client.results.assert_called_once_with('s1', 'containers')
-            with (out / 'container_findings.csv').open(encoding='utf-8-sig') as f:
+            client.results.assert_called_once_with('s1', {'containers'})
+            with (out / 'findings.csv').open(encoding='utf-8-sig') as f:
                 rows = list(csv.DictReader(f))
-            self.assertEqual([(r['project_id'], r['package']) for r in rows], [('P1', 'zlib')])
+            self.assertEqual([(r['engine'], r['project_id'], r['package']) for r in rows], [('containers', 'P1', 'zlib')])
+            self.assertFalse((out / 'container_findings.csv').exists())
             with (out / 'coverage.csv').open(encoding='utf-8-sig') as f:
                 cover = list(csv.DictReader(f))
             self.assertEqual([(r['scan_type'], r['scan_id'], r['newer_scan_than_selected']) for r in cover],
@@ -386,11 +387,44 @@ class Tests(unittest.TestCase):
                 with (out / 'package_matches.csv').open(encoding='utf-8-sig') as f:
                     self.assertEqual([r['package'] for r in csv.DictReader(f)], expected)
 
+    def test_categorize(self):
+        self.assertEqual(cx.cwe_text(['CWE-502', 79, 'CWE-502']), 'CWE-502; CWE-79')
+        self.assertEqual(cx.categorize(['CWE-917', 'CWE-20']), 'Code/Command Injection (RCE)')
+        self.assertEqual(cx.categorize('CWE-1000', 'Reflected_XSS_All_Clients'), 'Cross-Site Scripting (XSS)')
+        self.assertEqual(cx.categorize('', 'SQL_Injection'), 'SQL/NoSQL Injection')
+        self.assertEqual(cx.categorize('', 'github-pat', engine='secrets'), 'Hardcoded Credentials / Secrets')
+        self.assertEqual(cx.categorize('', 'Container Running As Root', engine='kics'), 'IaC Misconfiguration')
+        self.assertEqual(cx.categorize('', 'something new'), 'Other')
+
+    def test_code_findings_and_sca_cwes(self):
+        results = [
+            {'type': 'sast', 'id': 'r1', 'similarityId': '-123', 'severity': 'HIGH', 'state': 'TO_VERIFY',
+             'status': 'NEW', 'vulnerabilityDetails': {'cweId': 89},
+             'data': {'queryName': 'SQL_Injection', 'languageName': 'Java',
+                      'nodes': [{'fileName': '/src/Dao.java', 'line': 42}]}},
+            {'type': 'kics', 'id': 'r2', 'severity': 'MEDIUM',
+             'data': {'queryName': 'Privileged Container', 'group': 'Insecure Configurations', 'platform': 'Kubernetes',
+                      'fileName': 'deploy.yaml', 'line': 7, 'expectedValue': 'privileged is false', 'value': 'true'}},
+            {'type': 'sca', 'id': 'skip'}]
+        sast = cx.code_findings(results, {'project': 'P'}, 'sast')
+        self.assertEqual([(r['engine'], r['vulnerability'], r['category'], r['cwe'], r['file_path'], r['line'],
+                           r['severity']) for r in sast],
+                         [('sast', 'SQL_Injection', 'SQL/NoSQL Injection', 'CWE-89', '/src/Dao.java', 42, 'high')])
+        kics = cx.code_findings(results, {}, 'kics')
+        self.assertEqual((kics[0]['category'], kics[0]['file_path'], kics[0]['actual_value']),
+                         ('IaC: Insecure Configurations', 'deploy.yaml', 'true'))
+        bom = {'bomFormat': 'CycloneDX', 'components': [{'bom-ref': 'a', 'name': 'jackson-databind', 'version': '2.9.0',
+                               'purl': 'pkg:maven/com.fasterxml.jackson.core/jackson-databind@2.9.0'}],
+               'vulnerabilities': [{'id': 'CVE-2019-12384', 'cwes': [502], 'affects': [{'ref': 'a'}]}]}
+        _, vulns, _, _ = cx.flatten(bom, {})
+        self.assertEqual((vulns[0]['cwe'], vulns[0]['category']), ('CWE-502', 'Deserialization'))
+
     def test_scan_types_and_project_ids_args(self):
         self.assertEqual(cx.parse_args([]).engines, ['sca'])
         self.assertEqual(cx.parse_args(['--scan-types', 'SCA,containers,container']).engines, ['sca', 'containers'])
         with self.assertRaises(SystemExit), patch('sys.stderr'):
-            cx.parse_args(['--scan-types', 'sast'])
+            cx.parse_args(['--scan-types', 'dast'])
+        self.assertEqual(cx.parse_args(['--scan-types', 'sast,iac,secrets']).engines, ['sast', 'kics', 'secrets'])
         with tempfile.TemporaryDirectory() as tmp:
             plain = Path(tmp) / 'plain.csv'
             plain.write_text('\ufeffaaa\n\n bbb ,x\n', encoding='utf-8')
