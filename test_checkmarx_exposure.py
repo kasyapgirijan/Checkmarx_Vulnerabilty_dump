@@ -20,7 +20,7 @@ class Tests(unittest.TestCase):
         self.assertEqual(len(packages), 2)
         self.assertEqual([f['package'] for f in findings], ['@scope/thing', 'django'])
         self.assertEqual(findings[0]['severity'], 'high')
-        self.assertEqual(findings[0]['analysis_state'], 'not_affected')
+        self.assertEqual(findings[0]['triage_state'], 'not_affected')
         self.assertEqual((status, unresolved), ('present', 0))
         matches = cx.finding_filter(argparse.Namespace(ecosystems='python', package='django', cve='cve-test-1'))
         self.assertFalse(matches(findings[0]))
@@ -32,7 +32,7 @@ class Tests(unittest.TestCase):
         b = bom()
         b['vulnerabilities'][0].update(analysis=None, source=None, references=None, ratings=None)
         finding = cx.flatten(b, {})[1][0]
-        self.assertEqual((finding['analysis_state'], finding['severity']), ('', 'unknown'))
+        self.assertEqual((finding['triage_state'], finding['severity']), ('', 'unknown'))
 
     def test_unknown_is_not_clean(self):
         b = bom()
@@ -238,9 +238,10 @@ class Tests(unittest.TestCase):
                                       '--out', str(out)]), 2)  # Unknown ID and newer failed scan are flagged.
             client.export.assert_not_called()
             client.results.assert_called_once_with('s1', {'containers'})
-            with (out / 'container_findings.csv').open(encoding='utf-8-sig') as f:
+            with (out / 'findings.csv').open(encoding='utf-8-sig') as f:
                 rows = list(csv.DictReader(f))
-            self.assertEqual([(r['project_id'], r['package']) for r in rows], [('P1', 'zlib')])
+            self.assertEqual([(r['engine'], r['project_id'], r['package']) for r in rows], [('containers', 'P1', 'zlib')])
+            self.assertFalse((out / 'container_findings.csv').exists())
             with (out / 'coverage.csv').open(encoding='utf-8-sig') as f:
                 cover = list(csv.DictReader(f))
             self.assertEqual([(r['scan_type'], r['scan_id'], r['newer_scan_than_selected']) for r in cover],

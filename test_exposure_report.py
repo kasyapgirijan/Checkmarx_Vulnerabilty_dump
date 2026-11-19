@@ -79,12 +79,12 @@ class FolderReportTests(unittest.TestCase):
             # Checkmarx reported the CVE on the Payments log4j-core, but not React2Shell on Web.
             write(folder / 'findings.csv', cx.FIND, [
                 {**base, 'package': 'org.apache.logging.log4j/log4j-core', 'version': '2.14.1',
-                 'vulnerability': 'CVE-2021-44228', 'severity': 'critical', 'analysis_state': 'exploitable'}])
-            write(folder / 'container_findings.csv', cx.CONTAINER, [
-                {**base, 'project': 'Api', 'project_id': 'p3', 'image_name': 'api', 'image_tag': '1.0',
-                 'package': 'log4j-core', 'version': '2.15.0', 'vulnerability': 'CVE-2021-45046', 'state': 'TO_VERIFY'},
+                 'vulnerability': 'CVE-2021-44228', 'severity': 'critical', 'triage_state': 'exploitable', 'engine': 'sca'},
+                {**base, 'project': 'Api', 'project_id': 'p3', 'image_name': 'api', 'image_tag': '1.0', 'engine': 'containers',
+                 'package': 'log4j-core', 'version': '2.15.0', 'vulnerability': 'CVE-2021-45046', 'triage_state': 'TO_VERIFY'},
                 {**base, 'project': 'Old', 'project_id': 'p4', 'image_name': 'legacy', 'package': 'log4j',
-                 'version': '1.2.17', 'vulnerability': 'CVE-2021-44228'}])  # Name not in the rule, CVE is.
+                 'version': '1.2.17', 'vulnerability': 'CVE-2021-44228', 'engine': 'containers'},  # Name not in rule, CVE is.
+                {**base, 'engine': 'sast', 'vulnerability': 'SQL_Injection', 'file_path': 'a.java'}])  # Ignored.
             ini = Path(tmp) / 'report.ini'
             out = Path(tmp) / 'out' / 'report.csv'
             ini.write_text(INI.format(out=out, source=folder))

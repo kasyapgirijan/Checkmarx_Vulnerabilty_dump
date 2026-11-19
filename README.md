@@ -22,7 +22,7 @@ every package, every reported vulnerability, and which project, application and 
 - [Configuration](#configuration)
 - [SSL errors on a company network](#ssl-errors-on-a-company-network)
 - [Usage](#usage)
-  - [Choose scan types (SCA, Container Security)](#choose-scan-types)
+  - [Choose scan types (SCA, containers, SAST, IaC, secrets)](#choose-scan-types)
   - [Choose projects (including a CSV of project IDs)](#choose-projects)
   - [All options](#all-options)
 - [Load into PostgreSQL (incremental)](#load-into-postgresql-incremental)
@@ -198,16 +198,36 @@ There is no resume: if a run stops, start again in a new folder.
 
 ### Choose scan types
 
-| Option | Exports |
-| --- | --- |
-| `--scan-types sca` (default) | SCA only, exactly as before: `packages.csv`, `findings.csv`, `matches.csv` |
-| `--scan-types containers` | Container Security only: `container_findings.csv`, `container_matches.csv` |
-| `--scan-types sca,containers` | Both |
+| Scan type | Engine | What it finds |
+| --- | --- | --- |
+| `sca` (default) | SCA | Vulnerable open-source packages; also fills `packages.csv` (the inventory) |
+| `containers` | Container Security | Vulnerable OS and image packages |
+| `sast` | SAST | Code weaknesses such as SQL injection or XSS, with file and line |
+| `kics` (or `iac`) | KICS / IaC Security | Terraform, Kubernetes, Dockerfile, CloudFormation misconfigurations |
+| `secrets` | Secret detection | Passwords, keys and tokens committed to the repository |
 
-- `container-security` and `container` are accepted for `containers` (as in the
-  Checkmarx CLI's `--scan-types`). Case is ignored.
-- All output files are always created; the ones for a type you did not choose only
-  have a header row.
+Combine them with commas, for example `--scan-types sca,containers,sast,iac,secrets` to
+dump everything. **Every finding from every engine goes into one `findings.csv`**, with an
+`engine` column and the same core columns (`category`, `cwe`, `severity`,
+`vulnerability`, `triage_state`); package columns are filled for SCA and containers,
+`file_path` and `line` for SAST, IaC and secrets.
+
+- `container-security` and `container` are accepted for `containers`, `iac-security`
+  for `kics`, `secret-detection` for `secrets` (as in the Checkmarx CLI). Case is ignored.
+- All output files are always created; one with nothing to export only has a header row.
+- **Category** is a readable class from the finding's CWE (for example CWE-89 is
+  `SQL/NoSQL Injection`, CWE-502 `Deserialization`, CWE-917 `Code/Command Injection
+  (RCE)`). Without a CWE it comes from keywords in the finding name, IaC findings use
+  their KICS group (`IaC: Insecure Configurations`), secrets are always `Hardcoded
+  Credentials / Secrets`, and anything else is `Other`. SCA CWEs come from the
+  CycloneDX report.
+- Container, SAST, IaC and secret findings are read the way the official Checkmarx CLI
+  (`cx results show`) reads them: `GET /api/results?scan-id=...`, fetched once per scan
+  for all of them. A scan counts only when that engine completed.
+- Secret detection runs as a Checkmarx "micro-engine"; its engine and result names were
+  taken from the Checkmarx CLI, not yet seen on your tenant. If `coverage.csv` shows
+  `no_confirmed_completed_secrets` for scans that did run secret detection, send me the
+  `statusDetails` names from `scans.csv`.
 - `coverage.csv` has one row per project, branch **and scan type**; see `scan_type`.
 - Container findings are read the way the official Checkmarx CLI (`cx results show`)
   reads them: `GET /api/results?scan-id=...` for the scan, keeping results of type
@@ -280,7 +300,7 @@ the project's page in Checkmarx One.
 
 ### Choose findings
 
-These narrow `matches.csv`, `container_matches.csv` and `package_matches.csv` only; the
+These narrow `matches.csv` and `package_matches.csv` only; the
 other files always keep everything. `package_matches.csv` is the package inventory
 (vulnerable or not) filtered by `--ecosystems` and `--package`; it is only filled when
 one of those is given. They cannot be combined with `--dump-all` (filter the findings files in
@@ -294,7 +314,8 @@ Excel or Power BI instead).
 
 A finding must match every option given. `--ecosystems` applies to SCA only, since
 container results describe image (OS) packages without a package-URL ecosystem; for
-`container_matches.csv` only `--package` and `--cve` are used.
+container rows only `--package` and `--cve` are used. SAST, IaC and secret findings
+are never in `matches.csv` (filter `findings.csv` on `engine` and `category` instead).
 
 ```powershell
 python checkmarx_exposure.py --ecosystems npm --out npm-review
@@ -318,7 +339,7 @@ Every option in one place. Run `python checkmarx_exposure.py --help` for the sam
 | `--full` | off | With `--db`: reload the newest completed scan of every branch, even if already loaded |
 | `--no-files` | off | With `--db`: load only the database, without keeping CSV and raw files |
 | **What to export** | | |
-| `--scan-types TYPES` | `sca` | `sca`, `containers` (or `container-security`), or both comma-separated |
+| `--scan-types TYPES` | `sca` | Comma-separated: `sca`, `containers`, `sast`, `kics` (or `iac`), `secrets` |
 | `--dump-all` | off | Every retained scan instead of the latest per branch; implies `--raw-scan-report` |
 | `--branch NAME` | every branch | Only this exact branch (latest mode only). No branch is assumed to be production. |
 | `--raw-scan-report` | off | Also save Checkmarx's original SCA scan report JSON |
@@ -431,27 +452,45 @@ its tables after that.
 name, not the version, so moving to another version that is still vulnerable keeps the
 same finding (the versions are in `versions`). Container findings are keyed on
 vulnerability, image name (not the tag), image file and package, so a new image tag from
-the next build does not look like a fix.
+the next build does not look like a fix. SAST, IaC and secret findings are keyed on the
+Checkmarx similarity ID, which stays the same when code moves to another line (or on
+name, file and line when there is none).
+
+**Upgrading.** An existing database is upgraded in place at the start of the next run;
+nothing is reloaded and no history is lost. Findings get a `finding_id` and their
+`finding_events` are linked to it, `category` and `cwe` are filled from what is already
+stored, and the old `branch_state` table is folded into `scan_loads` (read it as
+`vw_branch_state`) and dropped.
 
 **Tables** (in the configured schema):
 
 | Table | Contents |
 | --- | --- |
-| `findings` | One row per finding per project, branch and scan type, with `project_id` and `project_name`: `status` (`open`/`fixed`), `first_seen_at`, `last_seen_at`, `fixed_at`, the scan IDs for each, `reopened_count`, `severity`, `triage_state`, package or image details, and the full row in `details` |
-| `finding_events` | History: `new`, `fixed` and `reopened`, with the scan and its date |
+| `findings` | One table for every engine: one row per finding per project, branch and `engine`, with a numeric `finding_id`, `project_id` and `project_name`: `status` (`open`/`fixed`), `first_seen_at`, `last_seen_at`, `fixed_at`, the scan IDs for each, `reopened_count`, `category`, `cwe`, `severity`, `triage_state`, package or image details (SCA, containers), `file_path` and `line` (SAST, IaC, secrets), and the full engine-specific row in `details` |
+| `finding_events` | History: `new`, `fixed` and `reopened`, with the scan and its date, linked by `finding_id` |
 | `vw_findings` (view) | All findings, open and fixed, with project name, product and applications |
-| `vw_open_findings` (view) | Open findings with project name, product and applications. Point Power BI here |
+| `vw_open_findings` (view) | Open findings from every engine, with project name, product and applications. Point Power BI here |
+| `vw_sca`, `vw_containers`, `vw_sast`, `vw_iac`, `vw_secrets` (views) | One engine each, with only the columns that apply to it (open and fixed; filter on `status`) |
+| `vw_category_summary` (view) | Open and fixed counts per project, branch, engine, category and severity |
 | `packages` | Package inventory per project and branch, vulnerable or not: `ecosystem`, `package`, `version`, `dependency_type`, `introduced_by`, `status` (`present`/`removed`), first and last seen, and when it was removed. Keyed with the version, so an upgrade shows the old version as removed and the new one as present |
 | `vw_current_packages` (view) | Packages present now, with project name, product and applications |
 | `projects`, `scans` | Latest project metadata and every scan seen |
 | `scan_loads` | Which scan was loaded for which scan type, and whether it could close findings |
-| `branch_state` | The last scan loaded per project, branch and scan type |
+| `vw_branch_state` (view) | The last scan loaded per project, branch and scan type; the next run continues from here |
 | `runs` | One row per run: `status` (`RUNNING`, `SUCCESS` or `FAILED`), `error`, the `run.json` summary and database counts |
 
 ```sql
 -- Open critical/high findings, oldest first
 SELECT project, branch, engine, vulnerability, package, versions, image_name, triage_state, first_seen_at
 FROM checkmarx.vw_open_findings WHERE severity IN ('critical', 'high') ORDER BY first_seen_at;
+
+-- Open findings by category across every engine
+SELECT engine, category, sum(open_findings) AS open_findings
+FROM checkmarx.vw_category_summary GROUP BY engine, category ORDER BY open_findings DESC;
+
+-- Open SQL injection found by SAST, with file and line
+SELECT project, branch, vulnerability, file_path, line, language, severity
+FROM checkmarx.vw_sast WHERE status = 'open' AND category = 'SQL/NoSQL Injection';
 
 -- Which projects use Java libraries (Maven or Gradle)
 SELECT DISTINCT project, branch FROM checkmarx.vw_current_packages WHERE ecosystem = 'maven';
@@ -541,10 +580,8 @@ advisory before relying on the result.
 | --- | --- |
 | `packages.csv` | Every package in every exported scan, vulnerable or not, with `dependency_type` (`direct`/`transitive`/`unknown`) and `introduced_by` |
 | `package_matches.csv` | The `packages.csv` rows that match `--ecosystems` and `--package` (empty without them) |
-| `findings.csv` | Every vulnerability/package pair, with severity and triage state |
-| `matches.csv` | The `findings.csv` rows that match `--ecosystems`, `--package` and `--cve` |
-| `container_findings.csv` | Every Container Security finding: image, package, vulnerability, severity, state (`--scan-types containers`) |
-| `container_matches.csv` | The `container_findings.csv` rows that match `--package` and `--cve` |
+| `findings.csv` | Every finding from every chosen engine, one row each: `engine`, `category`, `cwe`, `severity`, `triage_state`, and the package, image or file details that apply |
+| `matches.csv` | The SCA and container rows of `findings.csv` that match `--ecosystems`, `--package` and `--cve` |
 | `coverage.csv` | One row per project, branch and scan type (per scan with `--dump-all`): what was exported, and any gaps or errors |
 | `projects.csv` | Projects in scope with tags, groups and applications |
 | `applications.csv` | Applications with tags, description, criticality and project IDs |
@@ -553,14 +590,13 @@ advisory before relying on the result.
 | `run.json` | Time, scope, filters, SSL mode, metadata errors and limitations |
 | `raw/*.cdx.json` | Original CycloneDX report for each exported scan |
 | `raw/*.scan-report.json` | Original Checkmarx scan report (`--raw-scan-report` / `--dump-all`) |
-| `raw/*.containers.json` | Original Container Security result records for each exported scan |
+| `raw/*.containers.json`, `raw/*.sast.json`, `raw/*.kics.json`, `raw/*.secrets.json` | Original result records of each engine for each exported scan |
 | `raw/scans-PROJECT_ID.jsonl` | Original scan records per project |
 | `raw/projects.json`, `raw/applications.json` | Original project and application lists |
 
 ### Common columns
 
-Rows in `packages`, `findings`, `matches`, `container_findings`, `container_matches`,
-`coverage` and `scans` carry:
+Rows in `packages`, `findings`, `matches`, `coverage` and `scans` carry:
 
 - `project`, `project_id`, `product`, `branch`, `scan_id`, `scan_date`, `scan_age_days`
 - `applications`: application names as plain text separated by `; ` (empty when none)
@@ -580,14 +616,23 @@ from the dependency graph in the CycloneDX report:
   dependencies it comes through (up to 5, then `+N more`)
 - `unknown`: the report had no dependency graph
 
-### Container findings columns
+### Findings columns by engine
 
-`container_findings.csv` has the common columns plus `image_name`, `image_tag`,
-`image_file_path` (for example the Dockerfile), `image_origin`, `package`, `version`,
-`package_identifier`, `vulnerability` (CVE), `cwe`, `cvss_score`, `severity`, `state`
-(triage, for example `TO_VERIFY` or `NOT_EXPLOITABLE`), `status` (`NEW`, `RECURRENT`),
-`first_found_at`, `found_at`, `recommended_version`, `description`, `result_id` and
-`similarity_id`. Values are copied as Checkmarx returns them; severity is lower-cased.
+Every row of `findings.csv` has the common columns plus `engine`, `vulnerability`,
+`category`, `cwe`, `severity` (lower-cased), `triage_state` (for example `not_affected`,
+`TO_VERIFY`, `NOT_EXPLOITABLE`), `result_status` (`NEW`, `RECURRENT`) and `description`.
+The rest depend on the engine; columns that do not apply are empty:
+
+| Engine | Extra columns |
+| --- | --- |
+| `sca` | `package`, `version`, `ecosystem`, `purl`, `dependency_type`, `introduced_by`, `aliases`, `ratings_json`, `recommendation`, `affected_versions_json`, `source_url`, `package_link_status` |
+| `containers` | `image_name`, `image_tag`, `image_file_path` (for example the Dockerfile), `image_origin`, `package`, `version`, `package_identifier`, `cvss_score`, `recommendation` (recommended version) |
+| `sast` | `language`, `file_path`, `line` (first node of the data flow), `result_id`, `similarity_id` |
+| `kics` | `platform` (Terraform, Kubernetes, ...), `group`, `file_path`, `line`, `issue_type`, `expected_value`, `actual_value` |
+| `secrets` | `file_path`, `line`, `result_id`, `similarity_id` |
+
+Output folders from earlier versions had a separate `container_findings.csv`; the
+exposure report still reads those.
 
 Raw report files are named by scan ID; find a file's project by looking up its
 `scan_id` in `coverage.csv`. (The reports themselves may contain only a project name
@@ -600,7 +645,7 @@ time**, not at scan time.
 
 - **Severity** is the highest rating Checkmarx reports; all ratings are kept in
   `ratings_json`. `recommendation` is copied as given, never invented.
-- **Triage state** (`analysis_state`, for example `not_affected`) is preserved. A row is
+- **Triage state** (`triage_state`, for example `not_affected`) is preserved. A row is
   a reported association, not a confirmed exploitable vulnerability.
 - **Counts:** rows repeat across branches and scans; do not treat row counts as unique
   CVE counts.

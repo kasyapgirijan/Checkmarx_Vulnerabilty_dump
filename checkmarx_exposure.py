@@ -23,6 +23,8 @@ from requests.adapters import HTTPAdapter
 from urllib3.exceptions import InsecureRequestWarning
 from urllib3.util.retry import Retry
 
+from checkmarx_categories import categorize, cwe_text
+
 try:  # Optional PostgreSQL store (--db); CSV-only use needs neither it nor psycopg.
     import checkmarx_db
 except ImportError:
@@ -518,7 +520,7 @@ def flatten(bom, context):
                    'severity': severity, 'ratings_json': json.dumps(ratings, ensure_ascii=False),
                    'cwe': cwe_text(v.get('cwes') or []),
                    'category': categorize(v.get('cwes') or [], v.get('description'), v.get('detail')),
-                   'analysis_state': (v.get('analysis') or {}).get('state', ''),
+                   'triage_state': (v.get('analysis') or {}).get('state', ''),
                    'recommendation': v.get('recommendation', ''),
                    'source_url': (v.get('source') or {}).get('url', '')}
         for affected in v.get('affects') or [{'ref': ''}]:
@@ -528,88 +530,11 @@ def flatten(bom, context):
                 unresolved += 1
                 package = {**context, 'component_ref': ref, 'ecosystem': 'unknown',
                            'runtime_verified': 'not_assessed'}
-            findings.append({**package, **details,
+            findings.append({**package, **details, 'engine': 'sca',
                              'affected_versions_json': json.dumps(affected.get('versions', [])),
                              'package_link_status': 'matched' if ref in by_ref else 'unresolved'})
     status = 'present' if 'vulnerabilities' in bom else 'not_provided'
     return packages, findings, status, unresolved
-
-
-# CWE -> readable category. Covers the CWEs behind most SCA, container and SAST findings;
-# anything else falls back to keywords in the finding name, then to "Other".
-CWE_CATEGORIES = {
-    'Code/Command Injection (RCE)': (77, 78, 88, 94, 95, 96, 97, 1336, 917),
-    'SQL/NoSQL Injection': (89, 564, 943),
-    'Other Injection': (74, 75, 90, 91, 93, 113, 117, 134, 643, 652, 1236),
-    'Cross-Site Scripting (XSS)': (79, 80, 83, 87),
-    'Deserialization': (502,),
-    'Path Traversal / File Access': (22, 23, 35, 36, 59, 73, 434),
-    'Server-Side Request Forgery (SSRF)': (918,),
-    'XML External Entity (XXE)': (611, 776, 827),
-    'Open Redirect': (601,),
-    'Cross-Site Request Forgery (CSRF)': (352,),
-    'Prototype Pollution': (1321,),
-    'Hardcoded Credentials / Secrets': (798, 259, 321, 256, 522),
-    'Authentication': (287, 288, 290, 294, 306, 307, 521, 620, 640),
-    'Authorization / Access Control': (250, 266, 269, 276, 284, 285, 639, 732, 862, 863, 1220),
-    'Session Management': (384, 613, 614, 1004),
-    'Cryptography / TLS': (295, 297, 310, 311, 319, 326, 327, 328, 329, 330, 338, 757, 759, 760, 780, 916),
-    'Information Disclosure': (200, 201, 209, 215, 359, 497, 532, 538),
-    'Denial of Service': (400, 405, 407, 674, 770, 834, 835, 1333),
-    'Memory Corruption': (119, 120, 121, 122, 125, 131, 190, 191, 415, 416, 476, 680, 787, 822, 824),
-    'Race Condition': (362, 367),
-    'Input Validation': (20, 129, 1284, 1287),
-}
-CWE_TO_CATEGORY = {cwe: name for name, cwes in CWE_CATEGORIES.items() for cwe in cwes}
-# Checked in order against the finding/query name when no CWE maps (SAST query names, KICS titles).
-KEYWORD_CATEGORIES = [
-    (('deserializ',), 'Deserialization'),
-    (('sql_injection', 'sql injection', 'sqli', 'nosql'), 'SQL/NoSQL Injection'),
-    (('command_injection', 'command injection', 'code_injection', 'code injection', 'remote code',
-      'rce', 'os_command', 'expression_language'), 'Code/Command Injection (RCE)'),
-    (('xss', 'cross site scripting', 'cross-site scripting'), 'Cross-Site Scripting (XSS)'),
-    (('ssrf', 'server side request', 'server-side request'), 'Server-Side Request Forgery (SSRF)'),
-    (('xxe', 'xml external', 'xml_external'), 'XML External Entity (XXE)'),
-    (('path_traversal', 'path traversal', 'directory traversal'), 'Path Traversal / File Access'),
-    (('open_redirect', 'open redirect'), 'Open Redirect'),
-    (('csrf', 'cross site request', 'cross-site request'), 'Cross-Site Request Forgery (CSRF)'),
-    (('prototype pollution', 'prototype_pollution'), 'Prototype Pollution'),
-    (('hardcoded', 'hard_coded', 'hard-coded', 'secret', 'password', 'api key', 'token'),
-     'Hardcoded Credentials / Secrets'),
-    (('injection',), 'Other Injection'),
-    (('denial of service', 'redos', 'resource exhaustion'), 'Denial of Service'),
-    (('crypto', 'cipher', 'tls', 'ssl', 'weak_hash', 'weak hash', 'encryption'), 'Cryptography / TLS'),
-    (('privacy', 'information exposure', 'information_exposure', 'leak', 'disclosure'), 'Information Disclosure'),
-]
-
-
-def cwe_numbers(value):
-    """'CWE-79', 79, ['CWE-79', 502], '79; 502' -> [79, 502]."""
-    items = value if isinstance(value, (list, tuple)) else [value]
-    found = []
-    for item in items:
-        found += [int(n) for n in re.findall(r'\d+', str(item if item is not None else ''))]
-    return list(dict.fromkeys(found))
-
-
-def cwe_text(value):
-    return '; '.join(f'CWE-{n}' for n in cwe_numbers(value))
-
-
-def categorize(cwes, *texts, engine=''):
-    """Readable category from CWEs, else from keywords in the finding's name or title."""
-    for number in cwe_numbers(cwes):
-        if number in CWE_TO_CATEGORY:
-            return CWE_TO_CATEGORY[number]
-    if engine == 'secrets':
-        return 'Hardcoded Credentials / Secrets'
-    text = ' '.join(str(t or '') for t in texts).lower()
-    for words, name in KEYWORD_CATEGORIES:
-        if any(w in text for w in words):
-            return name
-    if engine == 'kics':
-        return 'IaC Misconfiguration'
-    return 'Other'
 
 
 def code_findings(results, context, engine):
@@ -631,7 +556,7 @@ def code_findings(results, context, engine):
                      'category': (f'IaC: {group}' if engine == 'kics' and group and not cwe
                                   else categorize(cwe, name, group, r.get('description'), engine=engine)),
                      'group': group, 'cwe': cwe, 'severity': str(r.get('severity') or 'unknown').lower(),
-                     'state': r.get('state', ''), 'status': r.get('status', ''),
+                     'triage_state': r.get('state', ''), 'result_status': r.get('status', ''),
                      'language': data.get('languageName', ''), 'platform': data.get('platform', ''),
                      'file_path': first.get('fileName') or data.get('fileName') or data.get('filename') or '',
                      'line': first.get('line') or data.get('line') or '',
@@ -651,8 +576,8 @@ def container_findings(results, context):
         data = r.get('data') or {}
         details = r.get('vulnerabilityDetails') or {}
         recommended = data.get('recommendedVersion')
-        rows.append({**context, 'result_id': r.get('id', ''), 'similarity_id': r.get('similarityId', ''),
-                     'image_name': data.get('imageName', ''), 'image_tag': data.get('imageTag', ''),
+        rows.append({**context, 'engine': 'containers', 'result_id': r.get('id', ''),
+                     'similarity_id': r.get('similarityId', ''), 'image_name': data.get('imageName', ''), 'image_tag': data.get('imageTag', ''),
                      'image_file_path': data.get('imageFilePath', ''), 'image_origin': data.get('imageOrigin', ''),
                      'package': data.get('packageName', ''), 'version': data.get('packageVersion', ''),
                      'package_identifier': data.get('packageIdentifier', ''),
@@ -661,9 +586,9 @@ def container_findings(results, context):
                      'cwe': cwe_text(details.get('cweId')), 'cvss_score': details.get('cvssScore', ''),
                      'category': categorize(details.get('cweId'), data.get('queryName'), r.get('description')),
                      'severity': str(r.get('severity') or 'unknown').lower(),
-                     'state': r.get('state', ''), 'status': r.get('status', ''),
+                     'triage_state': r.get('state', ''), 'result_status': r.get('status', ''),
                      'first_found_at': r.get('firstFoundAt', ''), 'found_at': r.get('foundAt', ''),
-                     'recommended_version': recommended if isinstance(recommended, str) else
+                     'recommendation': recommended if isinstance(recommended, str) else
                      (encoded(recommended) if recommended else ''),
                      'description': r.get('description', ''), 'runtime_verified': 'not_assessed'})
     return rows
@@ -672,9 +597,13 @@ def container_findings(results, context):
 META = ['application_ids_json', 'application_names_json', 'application_tags_json', 'application_mapping_status', 'project_tags_json', 'scan_tags_json']
 BASE = META + ['product', 'product_mapping', 'project', 'applications', 'project_id', 'branch', 'scan_id', 'scan_date', 'scan_age_days']
 PKG = BASE + ['component_ref', 'package', 'version', 'ecosystem', 'purl', 'scope', 'component_type', 'dependency_type', 'introduced_by', 'runtime_verified']
-FIND = PKG + ['vulnerability', 'aliases', 'category', 'cwe', 'severity', 'ratings_json', 'analysis_state', 'recommendation', 'affected_versions_json', 'source_url', 'package_link_status']
-CONTAINER = BASE + ['result_id', 'similarity_id', 'image_name', 'image_tag', 'image_file_path', 'image_origin', 'package', 'version', 'package_identifier', 'vulnerability', 'aliases', 'category', 'cwe', 'cvss_score', 'severity', 'state', 'status', 'first_found_at', 'found_at', 'recommended_version', 'description', 'runtime_verified']
-CODE = BASE + ['engine', 'result_id', 'similarity_id', 'vulnerability', 'category', 'group', 'cwe', 'severity', 'state', 'status', 'language', 'platform', 'file_path', 'line', 'issue_type', 'expected_value', 'actual_value', 'first_found_at', 'found_at', 'description']
+# findings.csv: one row per finding from every engine. Columns that do not apply to an engine are
+# empty: package columns for SAST/IaC/secrets, file and line for SCA and containers.
+FIND = BASE + ['engine', 'vulnerability', 'aliases', 'category', 'cwe', 'severity', 'cvss_score', 'triage_state', 'result_status',
+               'component_ref', 'package', 'version', 'ecosystem', 'purl', 'scope', 'component_type', 'dependency_type', 'introduced_by', 'package_link_status',
+               'image_name', 'image_tag', 'image_file_path', 'image_origin', 'package_identifier',
+               'language', 'platform', 'group', 'file_path', 'line', 'issue_type', 'expected_value', 'actual_value',
+               'recommendation', 'result_id', 'similarity_id', 'first_found_at', 'found_at', 'ratings_json', 'affected_versions_json', 'source_url', 'description', 'runtime_verified']
 COVER = BASE + ['scan_type', 'scan_role', 'status', 'latest_scan_id', 'latest_scan_status', 'newer_scan_than_selected', 'vulnerability_section', 'package_count', 'finding_count', 'unresolved_links', 'runtime_verified', 'error']
 PROJECT_FIELDS = ['project_id', 'project', 'applications', 'product', 'product_mapping', 'main_branch', 'repo_url', 'groups_json'] + META
 LINK_FIELDS = ['application_id', 'application', 'project_id', 'project', 'application_tags_json', 'project_tags_json']
@@ -698,11 +627,14 @@ class CsvWriter:
         self.writer = csv.DictWriter(self.file, fieldnames=fields, extrasaction='ignore')
         self.writer.writeheader()
         self.count = 0
+        self.engines = {}  # Rows per engine, for rows that carry one.
 
     def write(self, rows):
         for row in rows:
             self.writer.writerow({k: self.escape(v) for k, v in row.items()})
             self.count += 1
+            if row.get('engine'):
+                self.engines[row['engine']] = self.engines.get(row['engine'], 0) + 1
 
     def close(self):
         self.file.close()
@@ -1156,7 +1088,7 @@ class Exporter:
             (self.raw / f'{file_stem(scan["id"])}.{engine}.json').write_text(
                 encoded({'scanId': scan['id'], 'results': results}), encoding='utf-8')
             rows = code_findings(results, {k: c.get(k, '') for k in BASE}, engine)
-            self.csv['code_findings'].write(rows)
+            self.csv['findings'].write(rows)
             c.update(status=fresh, vulnerability_section='present', finding_count=len(rows), unresolved_links=0)
         except (ExportError, *RECOVERABLE) as exc:
             c.update(status='export_error', error=f'{engine} results: ' + safe_error(exc))
@@ -1172,8 +1104,8 @@ class Exporter:
             (self.raw / f'{file_stem(scan["id"])}.containers.json').write_text(
                 encoded({'scanId': scan['id'], 'results': containers}), encoding='utf-8')
             rows = container_findings(containers, {k: c.get(k, '') for k in BASE})
-            self.csv['container_findings'].write(rows)
-            self.csv['container_matches'].write(r for r in rows if self.container_matches(r))
+            self.csv['findings'].write(rows)
+            self.csv['matches'].write(r for r in rows if self.container_matches(r))
             c.update(status=fresh, vulnerability_section='present', finding_count=len(rows),
                      package_count=len({(r['image_name'], r['image_tag'], r['package'], r['version']) for r in rows}),
                      unresolved_links=0)
@@ -1264,9 +1196,7 @@ def export_run(args, client, product_map, out, store=None):
     with contextlib.ExitStack() as stack:
         csvs = {}
         for name, fields in [('application_projects', LINK_FIELDS), ('scans', SCAN_FIELDS),
-                             ('packages', PKG), ('package_matches', PKG), ('findings', FIND), ('matches', FIND),
-                             ('container_findings', CONTAINER), ('container_matches', CONTAINER),
-                             ('code_findings', CODE)]:
+                             ('packages', PKG), ('package_matches', PKG), ('findings', FIND), ('matches', FIND)]:
             csvs[name] = CsvWriter(out / f'{name}.csv', fields, escape=not args.raw_csv)
             stack.callback(csvs[name].close)
         progress = Progress(len(projects), enabled=not args.no_progress)
@@ -1285,8 +1215,7 @@ def export_run(args, client, product_map, out, store=None):
     summary = {'generated_at': exporter.now.isoformat(), 'visible_projects_in_scope': len(projects),
                'scan_types': args.engines,
                'packages': csvs['packages'].count, 'finding_rows': csvs['findings'].count,
-               'container_finding_rows': csvs['container_findings'].count,
-               'code_finding_rows': csvs['code_findings'].count,
+               'finding_rows_by_engine': dict(csvs['findings'].engines),
                'filters': {'ecosystems': args.ecosystems, 'package': args.package, 'cve': args.cve},
                'project_filters': {'project_id': project_ids(args) or None, 'project': args.project, 'tag': args.tag, 'application': args.application,
                                    'group': args.group, 'branch': args.branch},
@@ -1311,9 +1240,9 @@ def export_run(args, client, product_map, out, store=None):
     if args.no_files:
         print('Files were not kept (--no-files).')
     else:
-        print(f'Saved {csvs["packages"].count} packages, {csvs["findings"].count} SCA finding rows, '
-              f'{csvs["container_findings"].count} container finding rows, '
-              f'{csvs["code_findings"].count} SAST/IaC/secrets finding rows. '
+        engines = ', '.join(f'{e} {n}' for e, n in sorted(csvs['findings'].engines.items()))
+        print(f'Saved {csvs["packages"].count} packages, {csvs["findings"].count} finding rows'
+              f'{f" ({engines})" if engines else ""}. '
               f'Review coverage.csv. Output: {out.resolve()}')
     return 2 if incomplete else 0
 

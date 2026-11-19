@@ -189,12 +189,20 @@ def split_versions(text):
 def from_folder(folder):
     """Inventory and findings from a checkmarx_exposure.py output folder."""
     folder = Path(folder).expanduser()
-    if not (folder / 'packages.csv').exists() and not (folder / 'container_findings.csv').exists():
-        raise ReportError(f'{folder} has no packages.csv or container_findings.csv; '
+    if not (folder / 'packages.csv').exists() and not (folder / 'findings.csv').exists():
+        raise ReportError(f'{folder} has no packages.csv or findings.csv; '
                           'point source at a checkmarx_exposure.py output folder')
     inventory = [{**r, 'scan_type': 'sca'} for r in read_csv(folder / 'packages.csv')]
-    findings = [{**r, 'scan_type': 'sca'} for r in read_csv(folder / 'findings.csv')]
-    for r in read_csv(folder / 'container_findings.csv'):
+    findings = []
+    for r in read_csv(folder / 'findings.csv'):
+        engine = r.get('engine') or 'sca'  # Folders from before the engine column hold only SCA.
+        if engine == 'sca':
+            findings.append({**r, 'scan_type': 'sca', 'analysis_state': r.get('triage_state', r.get('analysis_state'))})
+        elif engine == 'containers':
+            row = {**r, 'scan_type': 'containers', 'ecosystem': '', 'analysis_state': r.get('triage_state', '')}
+            inventory.append(row)  # Container results only list packages with findings.
+            findings.append(row)
+    for r in read_csv(folder / 'container_findings.csv'):  # Older export folders.
         row = {**r, 'scan_type': 'containers', 'ecosystem': ''}
         inventory.append(row)
         findings.append({**row, 'analysis_state': r.get('state', '')})
@@ -221,7 +229,8 @@ def from_database(db_config):
             for r in conn.execute(
                     'SELECT project, product, applications, project_id, branch, engine, vulnerability, aliases, '
                     'package, versions, ecosystem, purl, image_name, image_tags, severity, triage_state, '
-                    'last_seen_scan_id AS scan_id, last_seen_at AS scan_date FROM vw_open_findings'):
+                    'last_seen_scan_id AS scan_id, last_seen_at AS scan_date FROM vw_open_findings '
+                    "WHERE engine IN ('sca', 'containers')"):
                 for version in split_versions(r['versions']):
                     row = {**r, 'version': version, 'scan_type': r['engine'], 'analysis_state': r['triage_state'],
                            'image_tag': r['image_tags']}
