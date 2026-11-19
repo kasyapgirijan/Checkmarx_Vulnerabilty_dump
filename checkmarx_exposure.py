@@ -47,10 +47,26 @@ RESULT_ENGINES = {
     'containers': {'status': ('containers',), 'types': ('containers',)},
     'sast': {'status': ('sast',), 'types': ('sast',)},
     'kics': {'status': ('kics', 'iac-security'), 'types': ('kics', 'iac-security')},
+    'sca': {'status': ('sca',), 'types': ('sca',)},  # Only for triage states; findings come from CycloneDX.
     'secrets': {'status': ('microengines', 'secrets', 'sscs-secret-detection', '2ms'),
                 'types': ('sscs-secret-detection', 'secret-detection', 'secrets')},
 }
 CODE_ENGINES = ('sast', 'kics', 'secrets')
+# Checkmarx One triage states (the same for every engine; tenants can add custom states):
+#   TO_VERIFY                 default for every new result: not triaged yet
+#   PROPOSED_NOT_EXPLOITABLE  someone proposed it as a false positive, awaiting approval
+#   NOT_EXPLOITABLE           triaged as a false positive
+#   CONFIRMED                 triaged as a real issue
+#   URGENT                    triaged as a real issue that needs fixing first
+# By default everything except the false-positive states is loaded (untriaged TO_VERIFY and
+# custom states included); --keep-states CONFIRMED,URGENT keeps verified true positives only.
+# Compared after triage_key(), so NotExploitable, NOT_EXPLOITABLE and not exploitable are the same.
+DEFAULT_KEEP_STATES = 'all'
+DEFAULT_EXCLUDE_STATES = 'NOT_EXPLOITABLE,PROPOSED_NOT_EXPLOITABLE'
+# CycloneDX analysis states, used for SCA only when /api/results has no state for a finding.
+CYCLONEDX_STATES = {'exploitable': 'CONFIRMED', 'in_triage': 'TO_VERIFY', 'not_affected': 'NOT_EXPLOITABLE',
+                    'false_positive': 'NOT_EXPLOITABLE', 'resolved': 'NOT_EXPLOITABLE',
+                    'resolved_with_pedigree': 'NOT_EXPLOITABLE'}
 REDIRECTS = (301, 302, 303, 307, 308)
 SEVERITY_RANK = {'critical': 5, 'high': 4, 'medium': 3, 'low': 2, 'info': 1, 'none': 0}
 ECOSYSTEM_ALIASES = {'node': 'npm', 'nodejs': 'npm', 'python': 'pypi'}
@@ -537,6 +553,77 @@ def flatten(bom, context):
     return packages, findings, status, unresolved
 
 
+def triage_key(state):
+    """'NotExploitable', 'NOT_EXPLOITABLE', 'not exploitable' -> 'not_exploitable'."""
+    text = re.sub(r'([a-z0-9])([A-Z])', r'\1_\2', str(state or '').strip())
+    return re.sub(r'[^a-z0-9]+', '_', text.lower()).strip('_')
+
+
+def state_list(text):
+    """'CONFIRMED, Urgent' -> {'confirmed', 'urgent'}; 'all' -> None; 'none' or '' -> empty set."""
+    keys = {triage_key(x) for x in str(text or '').split(',') if x.strip()}
+    if 'all' in keys:
+        return None
+    return keys - {'none'}
+
+
+def triage_filter(keep='all', exclude=''):
+    """(--keep-states, --exclude-states) -> (keep set or None for any state, exclude set)."""
+    return state_list(keep), state_list(exclude) or set()
+
+
+def split_by_triage(rows, triage):
+    """-> (rows to load, rows left out by triage). A row with no state counts as TO_VERIFY."""
+    keep, exclude = triage
+    if keep is None and not exclude:
+        return list(rows), []
+    kept, excluded = [], []
+    for row in rows:
+        state = triage_key(row.get('triage_state') or 'TO_VERIFY')
+        (kept if (keep is None or state in keep) and state not in exclude else excluded).append(row)
+    return kept, excluded
+
+
+def sca_package_key(name, version):
+    """'org.apache.logging.log4j:log4j-core' or '.../log4j-core' + version -> comparable key."""
+    return re.sub(r'[:/]', '/', str(name or '').strip().lower()), str(version or '').strip().lower()
+
+
+def sca_states(results):
+    """SCA results from /api/results -> {(vulnerability, package_key): state}. These are the states
+    set in Checkmarx (CycloneDX exports may not carry them)."""
+    states = {}
+    for r in results:
+        if str(r.get('type', '')).lower() != 'sca':
+            continue
+        data = r.get('data') or {}
+        paths = ((data.get('scaPackageData') or {}).get('dependencyPaths') or [[{}]])
+        node = paths[0][0] if paths and paths[0] and isinstance(paths[0][0], dict) else {}
+        name, version = node.get('name'), node.get('version')
+        if not name:  # packageIdentifier: Maven-com.example:lib-1.2.3
+            ident = str(data.get('packageIdentifier') or '')
+            ident = ident.split('-', 1)[1] if '-' in ident else ident
+            name, _, version = ident.rpartition('-')
+        vuln = (r.get('vulnerabilityDetails') or {}).get('cveName') or r.get('id') or ''
+        if r.get('state'):
+            states[(str(vuln).upper(), sca_package_key(name, version))] = r['state']
+    return states
+
+
+def apply_sca_states(rows, states):
+    """Set triage_state on SCA rows: Checkmarx state when known, else the CycloneDX analysis state
+    translated to Checkmarx names, else TO_VERIFY. The original CycloneDX value stays in analysis_state."""
+    for row in rows:
+        package = row.get('package') or ''
+        key = sca_package_key(package, row.get('version'))
+        if row.get('ecosystem') == 'maven' and '/' in package:
+            key = sca_package_key(package.replace('/', ':'), row.get('version'))
+        state = states.get((str(row.get('vulnerability', '')).upper(), key))
+        row['analysis_state'] = row.get('triage_state', '')
+        row['triage_state'] = state or CYCLONEDX_STATES.get(triage_key(row['analysis_state']), 'TO_VERIFY')
+    return rows
+
+
 def code_findings(results, context, engine):
     """SAST, KICS (IaC) and secret-detection rows from /api/results, one per finding."""
     rows = []
@@ -599,12 +686,12 @@ BASE = META + ['product', 'product_mapping', 'project', 'applications', 'project
 PKG = BASE + ['component_ref', 'package', 'version', 'ecosystem', 'purl', 'scope', 'component_type', 'dependency_type', 'introduced_by', 'runtime_verified']
 # findings.csv: one row per finding from every engine. Columns that do not apply to an engine are
 # empty: package columns for SAST/IaC/secrets, file and line for SCA and containers.
-FIND = BASE + ['engine', 'vulnerability', 'aliases', 'category', 'cwe', 'severity', 'cvss_score', 'triage_state', 'result_status',
+FIND = BASE + ['engine', 'vulnerability', 'aliases', 'category', 'cwe', 'severity', 'cvss_score', 'triage_state', 'analysis_state', 'result_status',
                'component_ref', 'package', 'version', 'ecosystem', 'purl', 'scope', 'component_type', 'dependency_type', 'introduced_by', 'package_link_status',
                'image_name', 'image_tag', 'image_file_path', 'image_origin', 'package_identifier',
                'language', 'platform', 'group', 'file_path', 'line', 'issue_type', 'expected_value', 'actual_value',
                'recommendation', 'result_id', 'similarity_id', 'first_found_at', 'found_at', 'ratings_json', 'affected_versions_json', 'source_url', 'description', 'runtime_verified']
-COVER = BASE + ['scan_type', 'scan_role', 'status', 'latest_scan_id', 'latest_scan_status', 'newer_scan_than_selected', 'vulnerability_section', 'package_count', 'finding_count', 'unresolved_links', 'runtime_verified', 'error']
+COVER = BASE + ['scan_type', 'scan_role', 'status', 'latest_scan_id', 'latest_scan_status', 'newer_scan_than_selected', 'vulnerability_section', 'package_count', 'finding_count', 'excluded_findings', 'unresolved_links', 'runtime_verified', 'error']
 PROJECT_FIELDS = ['project_id', 'project', 'applications', 'product', 'product_mapping', 'main_branch', 'repo_url', 'groups_json'] + META
 LINK_FIELDS = ['application_id', 'application', 'project_id', 'project', 'application_tags_json', 'project_tags_json']
 SCAN_FIELDS = BASE + ['status', 'status_details_json', 'engines_json']
@@ -795,6 +882,12 @@ def parse_args(argv=None):
                    help='With --db: reload the newest completed scan of every branch even if already loaded')
     p.add_argument('--no-files', action='store_true',
                    help='With --db: do not keep the CSV and raw files, only load the database')
+    p.add_argument('--exclude-states', default=DEFAULT_EXCLUDE_STATES, metavar='STATES',
+                   help=f'Comma-separated triage states left out (default {DEFAULT_EXCLUDE_STATES}: false '
+                        'positives). "none" leaves nothing out')
+    p.add_argument('--keep-states', default=DEFAULT_KEEP_STATES, metavar='STATES',
+                   help='Comma-separated triage states to load, for example CONFIRMED,URGENT for verified true '
+                        'positives only. Default all (every state not in --exclude-states)')
     p.add_argument('--no-progress', action='store_true', help='Do not show the progress bar on stderr')
     p.add_argument('--dump-all', action='store_true',
                    help='All retained scans and their completed reports; project filters allowed, branch/finding filters not')
@@ -804,6 +897,7 @@ def parse_args(argv=None):
     if not requested or unknown:
         p.error('--scan-types takes sca, containers, sast, kics (iac) and/or secrets')
     args.engines = list(dict.fromkeys(SCAN_TYPES[x] for x in requested))
+    args.triage = triage_filter(args.keep_states, args.exclude_states)
     if args.project_ids_file:
         try:
             from_file = load_project_ids(args.project_ids_file)
@@ -1052,13 +1146,15 @@ class Exporter:
             pkgs, vulns, section, unresolved = flatten(decode_json(content, 'CycloneDX'),
                                                        {k: c.get(k, '') for k in BASE})
             self.csv['packages'].write(pkgs)
+            vulns = apply_sca_states(vulns, self.sca_triage(scan['id']))
+            vulns, dismissed = split_by_triage(vulns, self.args.triage)
             self.csv['findings'].write(vulns)
             self.csv['matches'].write(r for r in vulns if self.matches(r))
             if self.package_matches:
                 self.csv['package_matches'].write(r for r in pkgs if self.package_matches(r))
             c.update(status=fresh, vulnerability_section=section, package_count=len(pkgs), finding_count=len(vulns),
-                     unresolved_links=unresolved)
-            loaded = (vulns, section, pkgs)
+                     excluded_findings=len(dismissed), unresolved_links=unresolved)
+            loaded = {'rows': vulns, 'section': section, 'packages': pkgs, 'dismissed': dismissed}
         except (ExportError, *RECOVERABLE) as exc:
             errors.append('CycloneDxJson: ' + safe_error(exc))
         if self.args.raw_scan_report:
@@ -1069,10 +1165,18 @@ class Exporter:
                 errors.append('ScanReportJson: ' + safe_error(exc))
         if loaded and self.store:
             # Outside the try: a database failure stops the run instead of passing as an export error.
-            self.store.load_scan(c['project_id'], c['branch'], 'sca', scan, *loaded)
+            self.store.load_scan(c['project_id'], c['branch'], 'sca', scan, **loaded)
         if errors:
             c.update(status='export_error', error='; '.join(errors))
         return c
+
+    def sca_triage(self, scan_id):
+        """Checkmarx triage states of a scan's SCA results. A failure stops this scan's export:
+        without the states, true positives cannot be told apart."""
+        try:
+            return sca_states(self.scan_results(scan_id, 'sca'))
+        except (ExportError, *RECOVERABLE) as exc:
+            raise ExportError('SCA triage states (/api/results): ' + safe_error(exc)) from None
 
     def scan_results(self, scan_id, engine):
         """/api/results for one scan, fetched once for every requested result engine."""
@@ -1087,14 +1191,16 @@ class Exporter:
             results = self.scan_results(scan['id'], engine)
             (self.raw / f'{file_stem(scan["id"])}.{engine}.json').write_text(
                 encoded({'scanId': scan['id'], 'results': results}), encoding='utf-8')
-            rows = code_findings(results, {k: c.get(k, '') for k in BASE}, engine)
+            rows, dismissed = split_by_triage(code_findings(results, {k: c.get(k, '') for k in BASE}, engine),
+                                              self.args.triage)
             self.csv['findings'].write(rows)
-            c.update(status=fresh, vulnerability_section='present', finding_count=len(rows), unresolved_links=0)
+            c.update(status=fresh, vulnerability_section='present', finding_count=len(rows),
+                     excluded_findings=len(dismissed), unresolved_links=0)
         except (ExportError, *RECOVERABLE) as exc:
             c.update(status='export_error', error=f'{engine} results: ' + safe_error(exc))
             return c
         if self.store:
-            self.store.load_scan(c['project_id'], c['branch'], engine, scan, rows, 'present')
+            self.store.load_scan(c['project_id'], c['branch'], engine, scan, rows, 'present', dismissed=dismissed)
         return c
 
     def export_containers(self, c, scan, fresh):
@@ -1103,17 +1209,19 @@ class Exporter:
             # Original container result records, unmodified; other engines' results are left out.
             (self.raw / f'{file_stem(scan["id"])}.containers.json').write_text(
                 encoded({'scanId': scan['id'], 'results': containers}), encoding='utf-8')
-            rows = container_findings(containers, {k: c.get(k, '') for k in BASE})
+            rows, dismissed = split_by_triage(container_findings(containers, {k: c.get(k, '') for k in BASE}),
+                                              self.args.triage)
             self.csv['findings'].write(rows)
             self.csv['matches'].write(r for r in rows if self.container_matches(r))
             c.update(status=fresh, vulnerability_section='present', finding_count=len(rows),
+                     excluded_findings=len(dismissed),
                      package_count=len({(r['image_name'], r['image_tag'], r['package'], r['version']) for r in rows}),
                      unresolved_links=0)
         except (ExportError, *RECOVERABLE) as exc:
             c.update(status='export_error', error='Containers results: ' + safe_error(exc))
             return c
         if self.store:
-            self.store.load_scan(c['project_id'], c['branch'], 'containers', scan, rows, 'present')
+            self.store.load_scan(c['project_id'], c['branch'], 'containers', scan, rows, 'present', dismissed=dismissed)
         return c
 
 
@@ -1216,7 +1324,9 @@ def export_run(args, client, product_map, out, store=None):
                'scan_types': args.engines,
                'packages': csvs['packages'].count, 'finding_rows': csvs['findings'].count,
                'finding_rows_by_engine': dict(csvs['findings'].engines),
-               'filters': {'ecosystems': args.ecosystems, 'package': args.package, 'cve': args.cve},
+               'filters': {'ecosystems': args.ecosystems, 'package': args.package, 'cve': args.cve,
+                           'keep_states': sorted(args.triage[0]) if args.triage[0] is not None else 'all',
+                           'exclude_states': sorted(args.triage[1])},
                'project_filters': {'project_id': project_ids(args) or None, 'project': args.project, 'tag': args.tag, 'application': args.application,
                                    'group': args.group, 'branch': args.branch},
                'scope': ('All retained scans; completed reports per scan type' if args.dump_all
@@ -1236,7 +1346,7 @@ def export_run(args, client, product_map, out, store=None):
     if store:
         db = summary['database']
         print(f'Database: {db["scans_loaded"]} new scan load(s), {db["new"]} new, {db["fixed"]} fixed, '
-              f'{db["reopened"]} reopened finding(s).')
+              f'{db["reopened"]} reopened, {db["excluded"]} excluded by triage finding(s).')
     if args.no_files:
         print('Files were not kept (--no-files).')
     else:

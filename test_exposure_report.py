@@ -140,7 +140,7 @@ class DatabaseReportTests(unittest.TestCase):
             client.export.side_effect = lambda sid, fmt, timeout: json.dumps(bom).encode()
             try:
                 with patch('sys.stdout'), patch('sys.stderr'):
-                    cx.main(['--db', '--config', str(config), '--no-files'])
+                    cx.main(['--db', '--config', str(config), '--no-files', '--exclude-states', 'none'])
                 ini = Path(tmp) / 'report.ini'
                 out = Path(tmp) / 'report.csv'
                 ini.write_text(INI.format(out=out, source='db').replace('[report]\n',

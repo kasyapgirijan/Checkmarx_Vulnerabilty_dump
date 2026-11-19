@@ -153,6 +153,12 @@ ALTER TABLE findings ADD COLUMN IF NOT EXISTS file_path text;
 ALTER TABLE findings ADD COLUMN IF NOT EXISTS line text;
 CREATE INDEX IF NOT EXISTS idx_findings_category ON findings (category);
 CREATE INDEX IF NOT EXISTS idx_findings_engine ON findings (engine);
+-- 'excluded': still reported, but triaged out of the kept states (--keep-states).
+ALTER TABLE findings DROP CONSTRAINT IF EXISTS findings_status_check;
+ALTER TABLE findings ADD CONSTRAINT findings_status_check CHECK (status IN ('open', 'fixed', 'excluded'));
+ALTER TABLE finding_events DROP CONSTRAINT IF EXISTS finding_events_event_check;
+ALTER TABLE finding_events ADD CONSTRAINT finding_events_event_check
+    CHECK (event IN ('new', 'fixed', 'reopened', 'excluded', 'included'));
 -- finding_id: one numeric id per finding, the link from finding_events.
 DO $$ BEGIN
     IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema = current_schema()
@@ -189,7 +195,7 @@ WHERE t.project_id = p.project_id AND t.project_name IS DISTINCT FROM p.name
 
 # Views are dropped and recreated on every run: CREATE OR REPLACE VIEW fails once a table
 # under a view gains a column. The vw_ names are what Power BI or other reports should use.
-VIEW_NAMES = ('open_findings', 'current_packages', 'vw_category_summary', 'vw_sca', 'vw_containers', 'vw_sast',
+VIEW_NAMES = ('open_findings', 'current_packages', 'vw_unique_open_findings', 'vw_category_summary', 'vw_sca', 'vw_containers', 'vw_sast',
               'vw_iac', 'vw_secrets', 'vw_branch_state', 'vw_open_findings', 'vw_current_packages', 'vw_findings')
 COMMON_VIEW_COLUMNS = ('finding_id, project, product, applications, project_id, branch, status, severity, category, '
                        'cwe, vulnerability')
@@ -221,8 +227,22 @@ CREATE VIEW vw_branch_state AS
 CREATE VIEW vw_category_summary AS
     SELECT project, project_id, branch, engine, category, severity,
            count(*) FILTER (WHERE status = 'open') AS open_findings,
-           count(*) FILTER (WHERE status = 'fixed') AS fixed_findings
+           count(*) FILTER (WHERE status = 'fixed') AS fixed_findings,
+           count(*) FILTER (WHERE status = 'excluded') AS excluded_findings
     FROM vw_findings GROUP BY project, project_id, branch, engine, category, severity;
+CREATE VIEW vw_unique_open_findings AS
+    SELECT project, project_id, product, applications, engine, finding_key,
+           max(vulnerability) AS vulnerability, max(category) AS category, max(cwe) AS cwe,
+           (array_agg(severity ORDER BY CASE severity WHEN 'critical' THEN 5 WHEN 'high' THEN 4
+                WHEN 'medium' THEN 3 WHEN 'low' THEN 2 WHEN 'info' THEN 1 ELSE 0 END DESC))[1] AS severity,
+           string_agg(DISTINCT triage_state, '; ') AS triage_state,
+           max(package) AS package, string_agg(DISTINCT NULLIF(versions, ''), '; ') AS versions,
+           max(ecosystem) AS ecosystem, max(image_name) AS image_name,
+           max(file_path) AS file_path, max(line) AS line,
+           string_agg(DISTINCT branch, '; ' ORDER BY branch) AS branches, count(*) AS branch_count,
+           min(first_seen_at) AS first_seen_at, max(last_seen_at) AS last_seen_at
+    FROM vw_findings WHERE status = 'open'
+    GROUP BY project, project_id, product, applications, engine, finding_key;
 """ + ''.join(f"CREATE VIEW {name} AS\n    SELECT {COMMON_VIEW_COLUMNS}, {extra}, {TRACKING_VIEW_COLUMNS}\n"
               f"    FROM vw_findings WHERE engine = '{engine}';\n"
               for name, (engine, extra) in ENGINE_VIEWS.items()))
@@ -369,7 +389,7 @@ class Store:
     def __init__(self, conn, schema, full=False):
         self.conn, self.schema, self.full = conn, schema, full
         self.run_id = None
-        self.counts = {'scans_loaded': 0, 'new': 0, 'fixed': 0, 'reopened': 0,
+        self.counts = {'scans_loaded': 0, 'new': 0, 'fixed': 0, 'reopened': 0, 'excluded': 0, 'included': 0,
                        'packages_added': 0, 'packages_removed': 0}
 
     @classmethod
@@ -523,20 +543,25 @@ class Store:
                  and (to_time(s.get('createdAt')) or last_created) > last_created]
         return list(reversed(newer))
 
-    def load_scan(self, project_id, branch, engine, scan, rows, section, packages=None):
+    def load_scan(self, project_id, branch, engine, scan, rows, section, packages=None, dismissed=None):
         """Apply one completed scan's findings in a single transaction.
 
         Findings are only closed when the scan carried a vulnerability section; otherwise the
         absence of a finding says nothing about whether it was fixed. With packages (SCA), the
         package inventory of the branch is replaced by this scan's: new versions are added and
         packages no longer listed are marked removed.
+
+        dismissed: rows of this scan left out by triage (--keep-states). They are never added; a
+        finding already stored becomes status 'excluded' (not 'fixed': it is still there), and goes
+        back to 'open' if it is later triaged into a kept state.
         """
         closes = section == 'present'
         created = to_time(scan.get('createdAt')) or datetime.now(timezone.utc)
         scan_id, pid = str(scan['id']), str(project_id)
         records = normalize(rows, engine)
         where = (pid, branch, engine)
-        new, reopened, fixed = [], [], []
+        excluded = {k: v for k, v in normalize(dismissed or [], engine).items() if k not in records}
+        new, reopened, fixed, included, newly_excluded = [], [], [], [], []
         with self.transaction() as cur:
             cur.execute('SELECT finding_key, status FROM findings WHERE project_id = %s AND branch = %s '
                         'AND engine = %s FOR UPDATE', where)
@@ -548,6 +573,8 @@ class Store:
                 else:
                     if existing[key] == 'fixed':
                         reopened.append(key)
+                    elif existing[key] == 'excluded':
+                        included.append(key)
                     cur.execute(f"""
                         UPDATE findings SET {', '.join(f'{c} = %s' for c in FINDING_COLUMNS)},
                             status = 'open', last_seen_at = %s, last_seen_scan_id = %s,
@@ -562,15 +589,28 @@ class Store:
                         status, first_seen_at, first_seen_scan_id, last_seen_at, last_seen_scan_id, updated_at)
                     VALUES ({', '.join(['%s'] * (4 + len(FINDING_COLUMNS)))}, 'open', %s, %s, %s, %s, now())
                     """, new)
+            for key, rec in excluded.items():
+                if key not in existing:
+                    continue  # Never stored, and not a true positive: leave it out.
+                if existing[key] != 'excluded':
+                    newly_excluded.append(key)
+                cur.execute(f"""
+                    UPDATE findings SET {', '.join(f'{c} = %s' for c in FINDING_COLUMNS)},
+                        status = 'excluded', last_seen_at = %s, last_seen_scan_id = %s,
+                        fixed_at = NULL, fixed_in_scan_id = NULL, updated_at = now()
+                    WHERE project_id = %s AND branch = %s AND engine = %s AND finding_key = %s
+                    """, ([rec[c] for c in FINDING_COLUMNS] + [created, scan_id, *where, key]))
             if closes:
-                fixed = [k for k, status in existing.items() if status == 'open' and k not in records]
+                fixed = [k for k, status in existing.items()
+                         if status == 'open' and k not in records and k not in excluded]
                 if fixed:
                     cur.executemany("""
                         UPDATE findings SET status = 'fixed', fixed_at = %s, fixed_in_scan_id = %s, updated_at = now()
                         WHERE project_id = %s AND branch = %s AND engine = %s AND finding_key = %s
                         """, [(created, scan_id, *where, k) for k in fixed])
             events = ([(row[3], 'new') for row in new] + [(k, 'reopened') for k in reopened]
-                      + [(k, 'fixed') for k in fixed])
+                      + [(k, 'fixed') for k in fixed] + [(k, 'included') for k in included]
+                      + [(k, 'excluded') for k in newly_excluded])
             if events:
                 cur.execute('SELECT finding_key, finding_id FROM findings WHERE project_id = %s AND branch = %s '
                             'AND engine = %s', where)
@@ -595,7 +635,10 @@ class Store:
         self.counts['new'] += len(new)
         self.counts['reopened'] += len(reopened)
         self.counts['fixed'] += len(fixed)
-        return {'new': len(new), 'reopened': len(reopened), 'fixed': len(fixed)}
+        self.counts['excluded'] += len(newly_excluded)
+        self.counts['included'] += len(included)
+        return {'new': len(new), 'reopened': len(reopened), 'fixed': len(fixed), 'excluded': len(newly_excluded),
+                'included': len(included)}
 
 
     def _load_packages(self, cur, where, scan_id, created, records):
