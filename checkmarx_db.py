@@ -153,6 +153,11 @@ CREATE INDEX IF NOT EXISTS idx_packages_project ON packages (project_id);
 ALTER TABLE findings ADD COLUMN IF NOT EXISTS project_name text;
 ALTER TABLE packages ADD COLUMN IF NOT EXISTS project_name text;
 ALTER TABLE finding_events ADD COLUMN IF NOT EXISTS project_name text;
+ALTER TABLE findings ADD COLUMN IF NOT EXISTS category text;
+ALTER TABLE findings ADD COLUMN IF NOT EXISTS cwe text;
+ALTER TABLE findings ADD COLUMN IF NOT EXISTS file_path text;
+ALTER TABLE findings ADD COLUMN IF NOT EXISTS line text;
+CREATE INDEX IF NOT EXISTS idx_findings_category ON findings (category);
 """
 
 # The project name is copied onto findings, packages and finding_events so each table reads
@@ -189,7 +194,8 @@ LOCK_SQL = "SELECT pg_try_advisory_lock(hashtext('checkmarx_exposure:' || %s))"
 
 FINDING_COLUMNS = ['vulnerability', 'aliases', 'package', 'versions', 'ecosystem', 'purl', 'image_name',
                    'image_tags', 'severity', 'cvss_score', 'triage_state', 'result_status', 'recommendation',
-                   'details']
+                   'category', 'cwe', 'file_path', 'line', 'details']
+CODE_ENGINES = ('sast', 'kics', 'secrets')
 
 
 class DatabaseError(Exception):
@@ -251,6 +257,7 @@ def joined(values):
 def finding_key(row, engine):
     """Stable identity of a finding across scans of one project, branch and engine.
 
+    SAST, KICS, secrets: Checkmarx similarity id, else query name + file + line.
     SCA: vulnerability + ecosystem + package name, without the version, so upgrading to a
     version that is still vulnerable keeps the same finding (versions are a column).
     Containers: vulnerability + image name (without tag) + image file + package, so a new
@@ -258,6 +265,11 @@ def finding_key(row, engine):
     """
     if engine == 'containers':
         parts = [row.get('vulnerability'), row.get('image_name'), row.get('image_file_path'), row.get('package')]
+    elif engine in CODE_ENGINES:
+        # Checkmarx's similarity id survives code moving between lines; fall back to name + location.
+        if row.get('similarity_id'):
+            return f"sim:{row['similarity_id']}"
+        parts = [row.get('vulnerability'), row.get('file_path'), row.get('line')]
     else:
         package = row.get('package') or 'ref:' + str(row.get('component_ref') or '')
         parts = [row.get('vulnerability'), row.get('ecosystem'), package]
@@ -272,7 +284,11 @@ def normalize(rows, engine):
     records = {}
     for key, items in groups.items():
         first = items[0]
-        if engine == 'containers':
+        if engine in CODE_ENGINES:
+            purl, ecosystem, versions, image_tags, cvss = '', '', '', '', ''
+            triage, result_status = joined(r.get('state') for r in items), joined(r.get('status') for r in items)
+            recommendation = joined(r.get('expected_value') for r in items)
+        elif engine == 'containers':
             purl, ecosystem = '', ''
             versions, triage = joined(r.get('version') for r in items), joined(r.get('state') for r in items)
             result_status = joined(r.get('status') for r in items)
@@ -291,6 +307,8 @@ def normalize(rows, engine):
             'image_name': first.get('image_name', ''), 'image_tags': image_tags,
             'severity': worst(r.get('severity') for r in items), 'cvss_score': cvss,
             'triage_state': triage, 'result_status': result_status, 'recommendation': recommendation,
+            'category': first.get('category', ''), 'cwe': joined(r.get('cwe') for r in items),
+            'file_path': joined(r.get('file_path') for r in items), 'line': joined(r.get('line') for r in items),
             'details': jsonb(items if len(items) > 1 else first),
             'first_found_at': min((t for t in found if t), default=None)}
     return records
