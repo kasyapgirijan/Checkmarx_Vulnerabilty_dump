@@ -23,7 +23,7 @@ every package, every reported vulnerability, and which project, application and 
 - [SSL errors on a company network](#ssl-errors-on-a-company-network)
 - [Usage](#usage)
   - [Choose scan types (SCA, containers, SAST, IaC, secrets)](#choose-scan-types)
-  - [True positives only (triage states)](#true-positives-only)
+  - [False positives left out (triage states)](#false-positives-left-out)
   - [Choose projects (including a CSV of project IDs)](#choose-projects)
   - [All options](#all-options)
 - [Load into PostgreSQL (incremental)](#load-into-postgresql-incremental)
@@ -299,30 +299,33 @@ excluded by another filter) are listed in a `WARNING:` line and under `metadata_
 in `run.json`, and the run exits with code 2. Find project IDs in `projects.csv` or in
 the project's page in Checkmarx One.
 
-### True positives only
+### False positives left out
 
-By default only findings triaged as **true positives** are written to `findings.csv` and
-loaded into the database. Checkmarx One uses the same triage states for every engine
+By default **false positives are left out**: findings triaged Not Exploitable or Proposed
+Not Exploitable are not written to `findings.csv` or loaded into the database. Everything
+else is, including untriaged To Verify findings, so new vulnerabilities from tonight's
+scan show up tomorrow. Checkmarx One uses the same triage states for every engine
 (SAST, SCA, containers, IaC and secrets):
 
 | State | Meaning | Loaded by default |
 | --- | --- | --- |
-| `TO_VERIFY` | Default for every new result: nobody has triaged it yet | No |
+| `TO_VERIFY` | Default for every new result: nobody has triaged it yet | Yes |
 | `PROPOSED_NOT_EXPLOITABLE` | Someone proposed it as a false positive; waiting for approval | No |
 | `NOT_EXPLOITABLE` | Triaged as a false positive (not a defect) | No |
-| `CONFIRMED` | Triaged as a real issue | **Yes** |
-| `URGENT` | Triaged as a real issue to fix first | **Yes** |
-| Custom states | Names your tenant added (`cx triage get-states`) | Only if listed |
+| `CONFIRMED` | Triaged as a real issue | Yes |
+| `URGENT` | Triaged as a real issue to fix first | Yes |
+| Custom states | Names your tenant added (`cx triage get-states`) | Yes, unless listed in `--exclude-states` |
 
-Change the list with `--keep-states` (case, spaces and `_` are ignored, so `NotExploitable`
-and `NOT_EXPLOITABLE` are the same):
+Change it with `--exclude-states` and `--keep-states` (case, spaces and `_` are ignored, so
+`NotExploitable` and `NOT_EXPLOITABLE` are the same). A finding is loaded when its state is
+in `--keep-states` and not in `--exclude-states`:
 
 | Option | Loads |
 | --- | --- |
-| *(default)* `--keep-states CONFIRMED,URGENT` | Verified true positives only |
-| `--keep-states CONFIRMED,URGENT,TO_VERIFY` | Everything except false positives and proposed false positives |
-| `--keep-states CONFIRMED,URGENT,"Accepted Risk"` | Adds a custom state |
-| `--keep-states all` | Every finding, whatever its state |
+| *(default)* `--exclude-states NOT_EXPLOITABLE,PROPOSED_NOT_EXPLOITABLE` | Everything except false positives and proposed false positives |
+| `--keep-states CONFIRMED,URGENT` | Verified true positives only (untriaged To Verify left out) |
+| `--exclude-states "NOT_EXPLOITABLE,PROPOSED_NOT_EXPLOITABLE,Accepted Risk"` | Also leaves out a custom state |
+| `--exclude-states none` | Every finding, whatever its state |
 
 - **SCA states come from the Checkmarx results API** (`/api/results`), the same states
   you set in the Checkmarx UI. The CycloneDX report's own `analysis_state` is kept in a
@@ -332,6 +335,8 @@ and `NOT_EXPLOITABLE` are the same):
   reported as an `export_error` instead of being loaded with unknown states.
 - `coverage.csv` shows `finding_count` (loaded) and `excluded_findings` (left out by
   triage) per scan.
+- Triage in Checkmarx carries over to later scans (it is stored per similarity ID), so a
+  finding marked Not Exploitable once stays out of every nightly scan after it.
 - In the database, a finding that was loaded and is later triaged out (for example
   marked Not Exploitable) gets `status = excluded`, not `fixed`, with an `excluded`
   event; if it is triaged back in, it returns to `open` with an `included` event. A
@@ -381,7 +386,8 @@ Every option in one place. Run `python checkmarx_exposure.py --help` for the sam
 | `--no-files` | off | With `--db`: load only the database, without keeping CSV and raw files |
 | **What to export** | | |
 | `--scan-types TYPES` | `sca` | Comma-separated: `sca`, `containers`, `sast`, `kics` (or `iac`), `secrets` |
-| `--keep-states STATES` | `CONFIRMED,URGENT` | Triage states to load; `all` for every finding. See [True positives only](#true-positives-only) |
+| `--exclude-states STATES` | `NOT_EXPLOITABLE,PROPOSED_NOT_EXPLOITABLE` | Triage states left out; `none` keeps every finding. See [False positives left out](#false-positives-left-out) |
+| `--keep-states STATES` | `all` | Only these triage states, for example `CONFIRMED,URGENT` |
 | `--dump-all` | off | Every retained scan instead of the latest per branch; implies `--raw-scan-report` |
 | `--branch NAME` | every branch | Only this exact branch (latest mode only). No branch is assumed to be production. |
 | `--raw-scan-report` | off | Also save Checkmarx's original SCA scan report JSON |
@@ -689,7 +695,7 @@ time**, not at scan time.
 - **Severity** is the highest rating Checkmarx reports; all ratings are kept in
   `ratings_json`. `recommendation` is copied as given, never invented.
 - **Triage state** (`triage_state`) is the Checkmarx state (`CONFIRMED`, `URGENT`, ...);
-  see [True positives only](#true-positives-only). For SCA, `analysis_state` keeps the
+  see [False positives left out](#false-positives-left-out). For SCA, `analysis_state` keeps the
   CycloneDX value as reported.
 - **Counts:** rows repeat across branches (use `vw_unique_open_findings` in the database); do not treat row counts as unique
   CVE counts.

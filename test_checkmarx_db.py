@@ -141,7 +141,7 @@ class PostgresTests(unittest.TestCase):
         self.runs += 1
         out = Path(self.tmp.name) / f'out{self.runs}'
         with patch('sys.stdout'), patch('sys.stderr'):
-            return cx.main(['--db', str(self.ini), '--out', str(out), '--stale-days', '3650', '--keep-states', 'all', *extra]), out
+            return cx.main(['--db', str(self.ini), '--out', str(out), '--stale-days', '3650', '--exclude-states', 'none', *extra]), out
 
     def findings(self, engine='sca'):
         rows = self.conn.execute(
@@ -233,7 +233,7 @@ class PostgresTests(unittest.TestCase):
                                + f'schema = {self.schema}\n')
         self.scans, self.boms = [scan('s1', 1)], {'s1': bom('npm-a')}
         with patch('sys.stdout'), patch('sys.stderr'):
-            code = cx.main(['--db', '--config', str(main_config), '--no-files', '--stale-days', '3650', '--keep-states', 'all'])
+            code = cx.main(['--db', '--config', str(main_config), '--no-files', '--stale-days', '3650', '--exclude-states', 'none'])
         self.assertEqual(code, 0)
         self.assertEqual(len(self.findings()), 1)
 
@@ -344,7 +344,7 @@ class PostgresTests(unittest.TestCase):
         self.scans = [scan('c1', 1, engine='containers')]
         self.results = {'c1': [result('1.0')]}
         with patch('sys.stdout'), patch('sys.stderr'):
-            self.assertEqual(cx.main(['--db', str(self.ini), '--no-files', '--keep-states', 'all', '--scan-types', 'containers',
+            self.assertEqual(cx.main(['--db', str(self.ini), '--no-files', '--exclude-states', 'none', '--scan-types', 'containers',
                                       '--stale-days', '3650']), 0)
         self.scans.append(scan('c2', 2, engine='containers'))
         self.results['c2'] = [result('2.0', 'NOT_EXPLOITABLE')]  # New image tag, same finding, triaged.
@@ -402,6 +402,12 @@ class PostgresTests(unittest.TestCase):
         self.scans = [{**scan('t1', 1), 'statusDetails': status}]
         self.results = {'t1': [sast('1', 'CONFIRMED'), sast('2', 'TO_VERIFY'), sast('3', 'NOT_EXPLOITABLE'),
                                sast('4', 'PROPOSED_NOT_EXPLOITABLE')]}
+        # Default: everything except Not Exploitable and Proposed Not Exploitable.
+        with patch('sys.stdout'), patch('sys.stderr'):
+            cx.main(['--db', str(self.ini), '--no-files', '--stale-days', '3650', '--scan-types', 'sast'])
+        self.assertEqual(list(self.findings('sast')), ['sim:1', 'sim:2'])
+        self.conn.execute(f'DROP SCHEMA {self.schema} CASCADE')
+        # Verified true positives only.
         _, out = self.run_export('--scan-types', 'sast', '--keep-states', 'CONFIRMED,URGENT')
         self.assertEqual(list(self.findings('sast')), ['sim:1'])
         with (out / 'findings.csv').open(encoding='utf-8-sig') as f:

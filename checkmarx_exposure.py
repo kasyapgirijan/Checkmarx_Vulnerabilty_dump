@@ -58,9 +58,11 @@ CODE_ENGINES = ('sast', 'kics', 'secrets')
 #   NOT_EXPLOITABLE           triaged as a false positive
 #   CONFIRMED                 triaged as a real issue
 #   URGENT                    triaged as a real issue that needs fixing first
-# Only CONFIRMED and URGENT are verified true positives. Compared after triage_key(), so
-# NotExploitable, NOT_EXPLOITABLE and not exploitable are the same.
-DEFAULT_KEEP_STATES = 'CONFIRMED,URGENT'
+# By default everything except the false-positive states is loaded (untriaged TO_VERIFY and
+# custom states included); --keep-states CONFIRMED,URGENT keeps verified true positives only.
+# Compared after triage_key(), so NotExploitable, NOT_EXPLOITABLE and not exploitable are the same.
+DEFAULT_KEEP_STATES = 'all'
+DEFAULT_EXCLUDE_STATES = 'NOT_EXPLOITABLE,PROPOSED_NOT_EXPLOITABLE'
 # CycloneDX analysis states, used for SCA only when /api/results has no state for a finding.
 CYCLONEDX_STATES = {'exploitable': 'CONFIRMED', 'in_triage': 'TO_VERIFY', 'not_affected': 'NOT_EXPLOITABLE',
                     'false_positive': 'NOT_EXPLOITABLE', 'resolved': 'NOT_EXPLOITABLE',
@@ -557,19 +559,28 @@ def triage_key(state):
     return re.sub(r'[^a-z0-9]+', '_', text.lower()).strip('_')
 
 
-def keep_states(text):
-    """--keep-states value -> set of triage keys, or None for 'all' (no filtering)."""
+def state_list(text):
+    """'CONFIRMED, Urgent' -> {'confirmed', 'urgent'}; 'all' -> None; 'none' or '' -> empty set."""
     keys = {triage_key(x) for x in str(text or '').split(',') if x.strip()}
-    return None if not keys or 'all' in keys else keys
+    if 'all' in keys:
+        return None
+    return keys - {'none'}
 
 
-def split_by_triage(rows, keep):
+def triage_filter(keep='all', exclude=''):
+    """(--keep-states, --exclude-states) -> (keep set or None for any state, exclude set)."""
+    return state_list(keep), state_list(exclude) or set()
+
+
+def split_by_triage(rows, triage):
     """-> (rows to load, rows left out by triage). A row with no state counts as TO_VERIFY."""
-    if keep is None:
+    keep, exclude = triage
+    if keep is None and not exclude:
         return list(rows), []
     kept, excluded = [], []
     for row in rows:
-        (kept if triage_key(row.get('triage_state') or 'TO_VERIFY') in keep else excluded).append(row)
+        state = triage_key(row.get('triage_state') or 'TO_VERIFY')
+        (kept if (keep is None or state in keep) and state not in exclude else excluded).append(row)
     return kept, excluded
 
 
@@ -871,10 +882,12 @@ def parse_args(argv=None):
                    help='With --db: reload the newest completed scan of every branch even if already loaded')
     p.add_argument('--no-files', action='store_true',
                    help='With --db: do not keep the CSV and raw files, only load the database')
+    p.add_argument('--exclude-states', default=DEFAULT_EXCLUDE_STATES, metavar='STATES',
+                   help=f'Comma-separated triage states left out (default {DEFAULT_EXCLUDE_STATES}: false '
+                        'positives). "none" leaves nothing out')
     p.add_argument('--keep-states', default=DEFAULT_KEEP_STATES, metavar='STATES',
-                   help=f'Comma-separated triage states to load (default {DEFAULT_KEEP_STATES}: true positives '
-                        'only). Add custom state names as needed, e.g. CONFIRMED,URGENT,TO_VERIFY. '
-                        '"all" loads every finding whatever its state')
+                   help='Comma-separated triage states to load, for example CONFIRMED,URGENT for verified true '
+                        'positives only. Default all (every state not in --exclude-states)')
     p.add_argument('--no-progress', action='store_true', help='Do not show the progress bar on stderr')
     p.add_argument('--dump-all', action='store_true',
                    help='All retained scans and their completed reports; project filters allowed, branch/finding filters not')
@@ -884,7 +897,7 @@ def parse_args(argv=None):
     if not requested or unknown:
         p.error('--scan-types takes sca, containers, sast, kics (iac) and/or secrets')
     args.engines = list(dict.fromkeys(SCAN_TYPES[x] for x in requested))
-    args.keep = keep_states(args.keep_states)
+    args.triage = triage_filter(args.keep_states, args.exclude_states)
     if args.project_ids_file:
         try:
             from_file = load_project_ids(args.project_ids_file)
@@ -1134,7 +1147,7 @@ class Exporter:
                                                        {k: c.get(k, '') for k in BASE})
             self.csv['packages'].write(pkgs)
             vulns = apply_sca_states(vulns, self.sca_triage(scan['id']))
-            vulns, dismissed = split_by_triage(vulns, self.args.keep)
+            vulns, dismissed = split_by_triage(vulns, self.args.triage)
             self.csv['findings'].write(vulns)
             self.csv['matches'].write(r for r in vulns if self.matches(r))
             if self.package_matches:
@@ -1179,7 +1192,7 @@ class Exporter:
             (self.raw / f'{file_stem(scan["id"])}.{engine}.json').write_text(
                 encoded({'scanId': scan['id'], 'results': results}), encoding='utf-8')
             rows, dismissed = split_by_triage(code_findings(results, {k: c.get(k, '') for k in BASE}, engine),
-                                              self.args.keep)
+                                              self.args.triage)
             self.csv['findings'].write(rows)
             c.update(status=fresh, vulnerability_section='present', finding_count=len(rows),
                      excluded_findings=len(dismissed), unresolved_links=0)
@@ -1197,7 +1210,7 @@ class Exporter:
             (self.raw / f'{file_stem(scan["id"])}.containers.json').write_text(
                 encoded({'scanId': scan['id'], 'results': containers}), encoding='utf-8')
             rows, dismissed = split_by_triage(container_findings(containers, {k: c.get(k, '') for k in BASE}),
-                                              self.args.keep)
+                                              self.args.triage)
             self.csv['findings'].write(rows)
             self.csv['matches'].write(r for r in rows if self.container_matches(r))
             c.update(status=fresh, vulnerability_section='present', finding_count=len(rows),
@@ -1312,7 +1325,8 @@ def export_run(args, client, product_map, out, store=None):
                'packages': csvs['packages'].count, 'finding_rows': csvs['findings'].count,
                'finding_rows_by_engine': dict(csvs['findings'].engines),
                'filters': {'ecosystems': args.ecosystems, 'package': args.package, 'cve': args.cve,
-                           'keep_states': sorted(args.keep) if args.keep is not None else 'all'},
+                           'keep_states': sorted(args.triage[0]) if args.triage[0] is not None else 'all',
+                           'exclude_states': sorted(args.triage[1])},
                'project_filters': {'project_id': project_ids(args) or None, 'project': args.project, 'tag': args.tag, 'application': args.application,
                                    'group': args.group, 'branch': args.branch},
                'scope': ('All retained scans; completed reports per scan type' if args.dump_all

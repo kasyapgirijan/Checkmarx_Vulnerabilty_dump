@@ -156,7 +156,7 @@ class Tests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             out = Path(tmp) / 'dump'
             # Newest scan (s4) failed SCA, so the current evidence is flagged for review.
-            self.assertEqual(cx.main(['--dump-all', '--keep-states', 'all', '--out', str(out)]), 2)
+            self.assertEqual(cx.main(['--dump-all', '--exclude-states', 'none', '--out', str(out)]), 2)
             self.assertEqual(client.export.call_count, 4)
             with (out / 'packages.csv').open(encoding='utf-8-sig') as f:
                 rows = list(csv.DictReader(f))
@@ -234,7 +234,7 @@ class Tests(unittest.TestCase):
             ids = Path(tmp) / 'ids.csv'
             ids.write_text('Project ID,name\n\np1,One\nmissing,Gone\n', encoding='utf-8')
             out = Path(tmp) / 'out'
-            self.assertEqual(cx.main(['--keep-states', 'all', '--scan-types', 'container-security', '--project-ids-file', str(ids),
+            self.assertEqual(cx.main(['--exclude-states', 'none', '--scan-types', 'container-security', '--project-ids-file', str(ids),
                                       '--out', str(out)]), 2)  # Unknown ID and newer failed scan are flagged.
             client.export.assert_not_called()
             client.results.assert_called_once_with('s1', {'containers'})
@@ -263,7 +263,7 @@ class Tests(unittest.TestCase):
             with tempfile.TemporaryDirectory() as tmp:
                 out = Path(tmp) / 'out'
                 with patch('sys.stderr'):
-                    self.assertEqual(cx.main(extra + ['--out', str(out), '--no-progress', '--keep-states', 'all']), 2)
+                    self.assertEqual(cx.main(extra + ['--out', str(out), '--no-progress', '--exclude-states', 'none']), 2)
                 with (out / 'coverage.csv').open(encoding='utf-8-sig') as f:
                     cover = list(csv.DictReader(f))
                 self.assertEqual([(r['scan_role'], r['status']) for r in cover],
@@ -383,7 +383,7 @@ class Tests(unittest.TestCase):
             with tempfile.TemporaryDirectory() as tmp:
                 out = Path(tmp) / 'out'
                 with patch('sys.stderr'), patch('sys.stdout'):
-                    cx.main(extra + ['--out', str(out), '--keep-states', 'all'])
+                    cx.main(extra + ['--out', str(out), '--exclude-states', 'none'])
                 with (out / 'package_matches.csv').open(encoding='utf-8-sig') as f:
                     self.assertEqual([r['package'] for r in csv.DictReader(f)], expected)
 
@@ -422,12 +422,15 @@ class Tests(unittest.TestCase):
     def test_triage_states(self):
         self.assertEqual([cx.triage_key(x) for x in ('NotExploitable', 'NOT_EXPLOITABLE', ' to verify ', None)],
                          ['not_exploitable', 'not_exploitable', 'to_verify', ''])
-        self.assertEqual(cx.parse_args([]).keep, {'confirmed', 'urgent'})
-        self.assertIsNone(cx.parse_args(['--keep-states', 'all']).keep)
-        rows = [{'triage_state': s} for s in ('Confirmed', 'URGENT', 'TO_VERIFY', '', 'NOT_EXPLOITABLE', 'Reviewed OK')]
-        kept, excluded = cx.split_by_triage(rows, cx.keep_states('confirmed,urgent,Reviewed OK'))
+        self.assertEqual(cx.parse_args([]).triage, (None, {'not_exploitable', 'proposed_not_exploitable'}))
+        self.assertEqual(cx.parse_args(['--exclude-states', 'none']).triage, (None, set()))
+        rows = [{'triage_state': s} for s in ('Confirmed', 'URGENT', 'TO_VERIFY', '', 'NOT_EXPLOITABLE',
+                                              'ProposedNotExploitable', 'Reviewed OK')]
+        kept, _ = cx.split_by_triage(rows, cx.parse_args([]).triage)  # Default: all but false positives.
+        self.assertEqual([r['triage_state'] for r in kept], ['Confirmed', 'URGENT', 'TO_VERIFY', '', 'Reviewed OK'])
+        kept, excluded = cx.split_by_triage(rows, cx.triage_filter('confirmed,urgent,Reviewed OK'))
         self.assertEqual([r['triage_state'] for r in kept], ['Confirmed', 'URGENT', 'Reviewed OK'])
-        self.assertEqual(len(excluded), 3)  # No state counts as TO_VERIFY.
+        self.assertEqual(len(excluded), 4)  # No state counts as TO_VERIFY.
         states = cx.sca_states([{'type': 'sca', 'id': 'CVE-1', 'state': 'URGENT',
                                  'data': {'packageIdentifier': 'Maven-org.apache.logging.log4j:log4j-core-2.14.1'}}])
         rows = cx.apply_sca_states([
